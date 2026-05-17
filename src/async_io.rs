@@ -32,6 +32,8 @@ use tokio::io::AsyncReadExt;
 
 use crate::{ByteOrder, GGUFModel, FILE_MAGIC_GGUF_BE, FILE_MAGIC_GGUF_LE};
 
+const DEFAULT_MAX_INPUT_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Async GGUF file container
 ///
 /// Provides async access to GGUF files using tokio.
@@ -39,6 +41,7 @@ pub struct AsyncGGUF {
     file: std::fs::File,
     byte_order: ByteOrder,
     max_array_size: u64,
+    max_input_bytes: u64,
 }
 
 impl AsyncGGUF {
@@ -64,6 +67,14 @@ impl AsyncGGUF {
     /// # }
     /// ```
     pub async fn open<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
+        Self::open_with_limits(path, 3, DEFAULT_MAX_INPUT_BYTES).await
+    }
+
+    pub async fn open_with_limits<P: AsRef<std::path::Path>>(
+        path: P,
+        max_array_size: u64,
+        max_input_bytes: u64,
+    ) -> Result<Self> {
         let path = path.as_ref();
 
         if !path.exists() {
@@ -88,7 +99,8 @@ impl AsyncGGUF {
         Ok(Self {
             file: std_file,
             byte_order,
-            max_array_size: 3,
+            max_array_size,
+            max_input_bytes,
         })
     }
 
@@ -107,11 +119,19 @@ impl AsyncGGUF {
         let file = self.file.try_clone()?;
         let expected_byte_order = self.byte_order.clone();
         let max_array_size = self.max_array_size;
+        let max_input_bytes = self.max_input_bytes;
         tokio::task::spawn_blocking(move || -> Result<GGUFModel> {
             let mut file = file;
             use std::io::{Read, Seek, SeekFrom};
             file.seek(SeekFrom::Start(0))?;
             let input_len = file.metadata()?.len();
+            if input_len > max_input_bytes {
+                return Err(anyhow!(
+                    "file size {} exceeds async input cap {} bytes",
+                    input_len,
+                    max_input_bytes
+                ));
+            }
             let mut magic = [0u8; 4];
             file.read_exact(&mut magic)?;
             let actual_byte_order = match i32::from_le_bytes(magic) {
@@ -125,8 +145,31 @@ impl AsyncGGUF {
             ) {
                 return Err(anyhow!("GGUF file changed between open() and decode()"));
             }
+            let len = usize::try_from(input_len)
+                .map_err(|_| anyhow!("file too large to snapshot into memory on this platform"))?;
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(len)
+                .map_err(|e| anyhow!("failed to reserve async snapshot ({len} bytes): {e}"))?;
+            bytes.resize(len, 0);
+            file.seek(SeekFrom::Start(0))?;
+            file.read_exact(&mut bytes)?;
+            let actual_byte_order =
+                match i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) {
+                    FILE_MAGIC_GGUF_LE => ByteOrder::LE,
+                    FILE_MAGIC_GGUF_BE => ByteOrder::BE,
+                    _ => return Err(anyhow!("invalid file magic: not a GGUF file")),
+                };
+            if !matches!(
+                (&expected_byte_order, &actual_byte_order),
+                (ByteOrder::LE, ByteOrder::LE) | (ByteOrder::BE, ByteOrder::BE)
+            ) {
+                return Err(anyhow!("GGUF file changed between open() and decode()"));
+            }
+            let mut cursor = std::io::Cursor::new(bytes);
+            cursor.seek(std::io::SeekFrom::Start(4))?;
             let mut container =
-                crate::GGUFContainer::new(actual_byte_order, Box::new(file), max_array_size)
+                crate::GGUFContainer::new(actual_byte_order, Box::new(cursor), max_array_size)
                     .with_input_len(input_len);
             container.decode()
         })
@@ -192,6 +235,15 @@ mod tests {
     #[tokio::test]
     async fn test_async_file_not_found() {
         let result = AsyncGGUF::open("nonexistent.gguf").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_async_input_limit_is_enforced() {
+        let container = AsyncGGUF::open_with_limits("tests/test-le-v3.gguf", 3, 1).await;
+        assert!(container.is_ok());
+        let mut container = container.unwrap();
+        let result = container.decode().await;
         assert!(result.is_err());
     }
 }

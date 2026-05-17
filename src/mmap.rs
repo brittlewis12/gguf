@@ -19,23 +19,26 @@
 //!
 //! # Features
 //!
-//! - Lazy loading: only accessed pages are loaded into memory
+//! - Immutable snapshot semantics for safer parsing
 //! - Efficient random access to tensor data
-//! - OS-managed memory paging
+//! - Backed by anonymous memory, not a live file mapping
 
 use anyhow::{anyhow, Result};
-use memmap2::{Mmap, MmapOptions};
+use memmap2::{Mmap, MmapMut, MmapOptions};
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::{ByteOrder, GGUFModel, FILE_MAGIC_GGUF_BE, FILE_MAGIC_GGUF_LE};
 
+const DEFAULT_MAX_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Memory-mapped GGUF file
 ///
-/// Provides efficient access to GGUF files using memory mapping.
-/// The file is not loaded into memory until specific regions are accessed.
+/// Provides efficient access to GGUF files using an immutable in-memory
+/// snapshot backed by anonymous mapped pages. This avoids exposing a live file
+/// mapping that can fault if the source file is concurrently mutated.
 pub struct MmapGGUF {
     #[allow(dead_code)]
     mmap: Arc<Mmap>,
@@ -82,23 +85,48 @@ impl MmapGGUF {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        Self::open_with_array_size(path, 3)
+        Self::open_with_limits(path, 3, DEFAULT_MAX_SNAPSHOT_BYTES)
     }
 
     pub fn open_with_array_size<P: AsRef<Path>>(path: P, max_array_size: u64) -> Result<Self> {
+        Self::open_with_limits(path, max_array_size, DEFAULT_MAX_SNAPSHOT_BYTES)
+    }
+
+    pub fn open_with_limits<P: AsRef<Path>>(
+        path: P,
+        max_array_size: u64,
+        max_snapshot_bytes: u64,
+    ) -> Result<Self> {
         let path = path.as_ref();
 
         if !path.exists() {
             return Err(anyhow!("file not found: {}", path.display()));
         }
 
-        let file = File::open(path)?;
-        let mmap = Arc::new(unsafe { MmapOptions::new().map_copy_read_only(&file)? });
+        let mut file = File::open(path)?;
+        let file_len = file.metadata()?.len();
+        if file_len > max_snapshot_bytes {
+            return Err(anyhow!(
+                "file size {} exceeds snapshot cap {} bytes",
+                file_len,
+                max_snapshot_bytes
+            ));
+        }
 
-        // Check magic number to determine byte order
-        if mmap.len() < 4 {
+        if file_len < 4 {
             return Err(anyhow!("file too small to be a valid GGUF file"));
         }
+
+        let mmap = if file_len == 0 {
+            Arc::new(MmapMut::map_anon(0)?.make_read_only()?)
+        } else {
+            let len = usize::try_from(file_len)
+                .map_err(|_| anyhow!("file too large to snapshot into memory on this platform"))?;
+            file.seek(SeekFrom::Start(0))?;
+            let mut snapshot = MmapOptions::new().len(len).map_anon()?;
+            file.read_exact(&mut snapshot)?;
+            Arc::new(snapshot.make_read_only()?)
+        };
 
         let magic = i32::from_le_bytes([mmap[0], mmap[1], mmap[2], mmap[3]]);
 
@@ -113,7 +141,7 @@ impl MmapGGUF {
             pos: 4,
         };
         let mut container = crate::GGUFContainer::new(byte_order, Box::new(reader), max_array_size)
-            .with_input_len(mmap.len() as u64);
+            .with_input_len(file_len);
         let model = container.decode()?;
 
         Ok(Self { mmap, model })
@@ -177,6 +205,12 @@ mod tests {
     #[test]
     fn test_mmap_file_not_found() {
         let result = MmapGGUF::open("nonexistent.gguf");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_mmap_snapshot_limit_is_enforced() {
+        let result = MmapGGUF::open_with_limits("tests/test-le-v3.gguf", 3, 1);
         assert!(result.is_err());
     }
 }

@@ -103,7 +103,7 @@ use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
 use log::debug;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{borrow::Borrow, collections::BTreeMap, fmt::Display};
+use std::{borrow::Borrow, collections::BTreeMap, fmt::Display, io::Read};
 
 /// Magic constant for `ggml` files (unversioned).
 pub const FILE_MAGIC_GGML: i32 = 0x67676d6c;
@@ -127,14 +127,18 @@ const BILLION: u64 = 1_000_000_000;
 
 const GGUF_DEFAULT_ALIGNMENT: u64 = 32;
 const MAX_ALIGNMENT: u64 = 65536;
-const MAX_TENSORS: u64 = 1_000_000;
-const MAX_KV: u64 = 1_000_000;
+const MAX_TENSORS: u64 = 100_000;
+const MAX_KV: u64 = 100_000;
 const MAX_METADATA_KEY_LEN: u64 = 65535;
 const MAX_TENSOR_NAME_LEN: u64 = 64;
-const MAX_STRING_VALUE_LEN: u64 = 100 * 1024 * 1024;
-const MAX_ARRAY_LEN: u64 = 10_000_000;
+const MAX_STRING_VALUE_LEN: u64 = 16 * 1024 * 1024;
+const MAX_ARRAY_LEN: u64 = 1_000_000;
+const MAX_STORED_ARRAY_ITEMS: u64 = 300_000;
 const MAX_DIMENSION: u64 = 1u64 << 30;
 const MAX_ELEMENTS: u64 = 1u64 << 40;
+const MAX_METADATA_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_HEADER_BYTES: u64 = 128 * 1024 * 1024;
+const DEFAULT_MAX_HELPER_INPUT_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Convert a number to a human-readable string.
 fn human_number(value: u64) -> String {
@@ -228,11 +232,25 @@ pub struct GGUFContainer {
     version: Version,
     reader: Box<dyn std::io::Read + 'static>,
     max_array_size: u64,
-    input_len: Option<u64>,
+    input_bounds: InputBounds,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum InputBounds {
+    Unknown,
+    Known(u64),
+    TrustedUnbounded,
 }
 
 impl GGUFContainer {
     /// Create a new `GGUFContainer` from a byte order and a reader.
+    ///
+    /// This is a low-level constructor. For checked decoding of untrusted
+    /// inputs, callers should also provide the total input length via
+    /// [`GGUFContainer::with_input_len`]. Callers that intentionally want to
+    /// parse an unbounded/trusted stream must opt in explicitly with
+    /// [`GGUFContainer::allow_unbounded_input`]. File-backed helpers in this
+    /// crate set the input length automatically.
     ///
     /// # Arguments
     ///
@@ -256,12 +274,21 @@ impl GGUFContainer {
             version: Version::V1(V1::default()),
             reader,
             max_array_size,
-            input_len: None,
+            input_bounds: InputBounds::Unknown,
         }
     }
 
     pub fn with_input_len(mut self, input_len: u64) -> Self {
-        self.input_len = Some(input_len);
+        self.input_bounds = InputBounds::Known(input_len);
+        self
+    }
+
+    /// Explicitly opt into decoding a trusted unbounded reader.
+    ///
+    /// This disables EOF-based tensor range validation. Prefer
+    /// [`GGUFContainer::with_input_len`] for untrusted inputs.
+    pub fn allow_unbounded_input(mut self) -> Self {
+        self.input_bounds = InputBounds::TrustedUnbounded;
         self
     }
 
@@ -285,6 +312,9 @@ impl GGUFContainer {
     /// - The file has an invalid or unsupported GGUF version
     /// - The file contains malformed data
     /// - An I/O error occurs while reading
+    /// - The caller used [`GGUFContainer::new`] without either
+    ///   [`GGUFContainer::with_input_len`] or
+    ///   [`GGUFContainer::allow_unbounded_input`]
     ///
     /// # Examples
     ///
@@ -296,6 +326,12 @@ impl GGUFContainer {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn decode(&mut self) -> Result<GGUFModel> {
+        if matches!(self.input_bounds, InputBounds::Unknown) {
+            return Err(anyhow!(
+                "input length is required for checked decoding; use with_input_len(...) or explicitly opt into allow_unbounded_input()"
+            ));
+        }
+
         let version = match self.bo {
             ByteOrder::LE => self.reader.read_i32::<LittleEndian>()?,
             ByteOrder::BE => self.reader.read_i32::<BigEndian>()?,
@@ -357,7 +393,12 @@ impl GGUFContainer {
             version: self.version.clone(),
         };
 
-        model.decode(&mut self.reader, self.input_len)?;
+        let header_preamble_len = match self.version {
+            Version::V1(_) => 4 + 4 + 4 + 4,
+            Version::V2(_) | Version::V3(_) => 4 + 4 + 8 + 8,
+        } as u64;
+
+        model.decode(&mut self.reader, self.input_bounds, header_preamble_len)?;
         Ok(model)
     }
 
@@ -733,13 +774,19 @@ impl GGUFModel {
     pub(crate) fn decode(
         &mut self,
         reader: impl std::io::Read,
-        input_len: Option<u64>,
+        input_bounds: InputBounds,
+        header_preamble_len: u64,
     ) -> Result<()> {
         let mut reader = CountingReader::new(reader);
+        let mut seen_tensor_names =
+            std::collections::HashSet::with_capacity(self.num_tensor() as usize);
         // decode kv
         for _i in 0..self.num_kv() {
             let key =
                 self.read_string_limited(&mut reader, MAX_METADATA_KEY_LEN, "metadata key", false)?;
+            if self.kv.contains_key(&key) {
+                return Err(anyhow!("duplicate metadata key {key:?}"));
+            }
             let value_type: MetadataValueType = self.read_u32(&mut reader)?.try_into()?;
             let value = match value_type {
                 MetadataValueType::Uint8 => Value::from(self.read_u8(&mut reader)?),
@@ -766,6 +813,9 @@ impl GGUFModel {
                 debug!("kv [{}] vtype {:?} key={}, value={}", _i, value_type, key, value);
             }
             self.kv.insert(key, value);
+            if reader.bytes_read() > MAX_METADATA_BYTES {
+                return Err(anyhow!("metadata section exceeds cap {} bytes", MAX_METADATA_BYTES));
+            }
         }
 
         let alignment = self.alignment()?;
@@ -774,6 +824,9 @@ impl GGUFModel {
         for _ in 0..self.num_tensor() {
             let name =
                 self.read_string_limited(&mut reader, MAX_TENSOR_NAME_LEN, "tensor name", false)?;
+            if !seen_tensor_names.insert(name.clone()) {
+                return Err(anyhow!("duplicate tensor name {name:?}"));
+            }
             let dims = self.read_u32(&mut reader)?;
             if dims == 0 || dims > 4 {
                 return Err(anyhow!("tensor {name:?} declares {dims} dimensions (must be 1..=4)"));
@@ -831,9 +884,13 @@ impl GGUFModel {
                 .parameters
                 .checked_add(elements)
                 .ok_or_else(|| anyhow!("total parameter count overflows u64"))?;
+
+            if reader.bytes_read() > MAX_HEADER_BYTES {
+                return Err(anyhow!("GGUF header exceeds cap {} bytes", MAX_HEADER_BYTES));
+            }
         }
 
-        let tensor_data_start = 4u64
+        let tensor_data_start = header_preamble_len
             .checked_add(reader.bytes_read())
             .ok_or_else(|| anyhow!("header length overflows u64"))?;
         let tensor_data_start = tensor_data_start
@@ -842,7 +899,7 @@ impl GGUFModel {
             / alignment
             * alignment;
 
-        self.validate_tensor_ranges(tensor_data_start, input_len)?;
+        self.validate_tensor_ranges(tensor_data_start, input_bounds)?;
 
         Ok(())
     }
@@ -856,13 +913,20 @@ impl GGUFModel {
         if raw == 0 {
             return Err(anyhow!("general.alignment is 0"));
         }
+        if raw % 8 != 0 {
+            return Err(anyhow!("general.alignment {raw} is not a multiple of 8"));
+        }
         if raw > MAX_ALIGNMENT {
             return Err(anyhow!("general.alignment {raw} exceeds cap {MAX_ALIGNMENT}"));
         }
         Ok(raw)
     }
 
-    fn validate_tensor_ranges(&self, tensor_data_start: u64, input_len: Option<u64>) -> Result<()> {
+    fn validate_tensor_ranges(
+        &self,
+        tensor_data_start: u64,
+        input_bounds: InputBounds,
+    ) -> Result<()> {
         let mut ranges: Vec<(&str, u64, u64)> = self
             .tensors
             .iter()
@@ -873,7 +937,7 @@ impl GGUFModel {
                 let abs_end = abs_start
                     .checked_add(t.size)
                     .ok_or_else(|| anyhow!("tensor {:?} byte range overflows u64", t.name))?;
-                if let Some(input_len) = input_len {
+                if let InputBounds::Known(input_len) = input_bounds {
                     if abs_end > input_len {
                         return Err(anyhow!(
                             "tensor {:?} extends past EOF: end={} file_size={}",
@@ -993,86 +1057,93 @@ impl GGUFModel {
             .map_err(|e| anyhow!("failed to reserve {context} buffer ({len} bytes): {e}"))?;
         buffer.resize(len, 0);
         reader.read_exact(&mut buffer)?;
-        Ok(String::from_utf8_lossy(&buffer).to_string())
+        String::from_utf8(buffer).map_err(|e| anyhow!("{context} is not valid UTF-8: {e}"))
     }
 
-    fn read_array(&self, mut reader: impl std::io::Read) -> Result<Vec<Value>> {
+    fn read_array<R: std::io::Read>(&self, reader: &mut CountingReader<R>) -> Result<Vec<Value>> {
         let mut data = Vec::new();
-        let item_type: MetadataValueType = self.read_u32(&mut reader)?.try_into()?;
-        let array_len = self.read_version_size(&mut reader)?;
+        let item_type: MetadataValueType = self.read_u32(&mut *reader)?.try_into()?;
+        let array_len = self.read_version_size(&mut *reader)?;
         if array_len > MAX_ARRAY_LEN {
             return Err(anyhow!("array length {array_len} exceeds cap {MAX_ARRAY_LEN}"));
         }
-        let read_count = usize::try_from(u64::min(array_len, self.max_array_size))
-            .map_err(|_| anyhow!("array storage length does not fit in usize"))?;
+        let read_count = usize::try_from(
+            array_len
+                .min(self.max_array_size)
+                .min(MAX_STORED_ARRAY_ITEMS),
+        )
+        .map_err(|_| anyhow!("array storage length does not fit in usize"))?;
         data.try_reserve_exact(read_count)
             .map_err(|e| anyhow!("failed to reserve array buffer ({read_count} items): {e}"))?;
         for i in 0..array_len {
             if data.len() < read_count {
-                let value = self.read_array_value(&mut reader, &item_type)?;
+                let value = self.read_array_value(reader, &item_type)?;
                 data.push(value);
             } else {
-                self.skip_array_value(&mut reader, &item_type)
+                self.skip_array_value(reader, &item_type)
                     .map_err(|e| anyhow!("failed to skip array item {i}: {e}"))?;
+            }
+            if reader.bytes_read() > MAX_METADATA_BYTES {
+                return Err(anyhow!("metadata section exceeds cap {} bytes", MAX_METADATA_BYTES));
             }
         }
 
         Ok(data)
     }
 
-    fn read_array_value(
+    fn read_array_value<R: std::io::Read>(
         &self,
-        mut reader: impl std::io::Read,
+        reader: &mut CountingReader<R>,
         item_type: &MetadataValueType,
     ) -> Result<Value> {
         Ok(match item_type {
-            MetadataValueType::Uint8 => Value::from(self.read_u8(&mut reader)?),
-            MetadataValueType::Int8 => Value::from(self.read_i8(&mut reader)?),
-            MetadataValueType::Uint16 => Value::from(self.read_u16(&mut reader)?),
-            MetadataValueType::Int16 => Value::from(self.read_i16(&mut reader)?),
-            MetadataValueType::Uint32 => Value::from(self.read_u32(&mut reader)?),
-            MetadataValueType::Int32 => Value::from(self.read_i32(&mut reader)?),
-            MetadataValueType::Float32 => Value::from(self.read_f32(&mut reader)?),
-            MetadataValueType::Bool => Value::from(self.read_bool(&mut reader)?),
+            MetadataValueType::Uint8 => Value::from(self.read_u8(reader)?),
+            MetadataValueType::Int8 => Value::from(self.read_i8(reader)?),
+            MetadataValueType::Uint16 => Value::from(self.read_u16(reader)?),
+            MetadataValueType::Int16 => Value::from(self.read_i16(reader)?),
+            MetadataValueType::Uint32 => Value::from(self.read_u32(reader)?),
+            MetadataValueType::Int32 => Value::from(self.read_i32(reader)?),
+            MetadataValueType::Float32 => Value::from(self.read_f32(reader)?),
+            MetadataValueType::Bool => Value::from(self.read_bool(reader)?),
             MetadataValueType::String => Value::from(self.read_string_limited(
-                &mut reader,
+                reader,
                 MAX_STRING_VALUE_LEN,
                 "array string value",
                 true,
             )?),
-            MetadataValueType::Uint64 => Value::from(self.read_u64(&mut reader)?),
-            MetadataValueType::Int64 => Value::from(self.read_i64(&mut reader)?),
-            MetadataValueType::Float64 => Value::from(self.read_f64(&mut reader)?),
+            MetadataValueType::Uint64 => Value::from(self.read_u64(reader)?),
+            MetadataValueType::Int64 => Value::from(self.read_i64(reader)?),
+            MetadataValueType::Float64 => Value::from(self.read_f64(reader)?),
             MetadataValueType::Array => return Err(anyhow!("unsupported item value type: Array")),
         })
     }
 
-    fn skip_array_value(
+    fn skip_array_value<R: std::io::Read>(
         &self,
-        mut reader: impl std::io::Read,
+        reader: &mut CountingReader<R>,
         item_type: &MetadataValueType,
     ) -> Result<()> {
         match item_type {
             MetadataValueType::Bool => {
-                let _ = self.read_bool(&mut reader)?;
+                let _ = self.read_bool(reader)?;
                 Ok(())
             }
-            MetadataValueType::Uint8 | MetadataValueType::Int8 => skip_exact(&mut reader, 1),
-            MetadataValueType::Uint16 | MetadataValueType::Int16 => skip_exact(&mut reader, 2),
+            MetadataValueType::Uint8 | MetadataValueType::Int8 => skip_exact(reader, 1),
+            MetadataValueType::Uint16 | MetadataValueType::Int16 => skip_exact(reader, 2),
             MetadataValueType::Uint32 | MetadataValueType::Int32 | MetadataValueType::Float32 => {
-                skip_exact(&mut reader, 4)
+                skip_exact(reader, 4)
             }
             MetadataValueType::Uint64 | MetadataValueType::Int64 | MetadataValueType::Float64 => {
-                skip_exact(&mut reader, 8)
+                skip_exact(reader, 8)
             }
             MetadataValueType::String => {
-                let len = self.read_version_size(&mut reader)?;
-                if len > MAX_STRING_VALUE_LEN {
-                    return Err(anyhow!(
-                        "array string value length {len} exceeds cap {MAX_STRING_VALUE_LEN}"
-                    ));
-                }
-                skip_exact(&mut reader, len)
+                let _ = self.read_string_limited(
+                    reader,
+                    MAX_STRING_VALUE_LEN,
+                    "array string value",
+                    true,
+                )?;
+                Ok(())
             }
             MetadataValueType::Array => Err(anyhow!("unsupported item value type: Array")),
         }
@@ -1204,7 +1275,7 @@ impl GGUFModel {
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub fn get_gguf_container(file: &str) -> Result<GGUFContainer> {
-    get_gguf_container_array_size(file, 3)
+    get_gguf_container_array_size_with_limit(file, 3, DEFAULT_MAX_HELPER_INPUT_BYTES)
 }
 
 /// Get a `GGUFContainer` from a file with the provided max array size.
@@ -1235,23 +1306,53 @@ pub fn get_gguf_container(file: &str) -> Result<GGUFContainer> {
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub fn get_gguf_container_array_size(file: &str, max_array_size: u64) -> Result<GGUFContainer> {
+    get_gguf_container_array_size_with_limit(file, max_array_size, DEFAULT_MAX_HELPER_INPUT_BYTES)
+}
+
+pub fn get_gguf_container_array_size_with_limit(
+    file: &str,
+    max_array_size: u64,
+    max_input_bytes: u64,
+) -> Result<GGUFContainer> {
     if !std::path::Path::new(file).exists() {
         return Err(anyhow!("file not found"));
     }
     let mut reader = std::fs::File::open(file)?;
     let input_len = reader.metadata()?.len();
-    let byte_le = reader.read_i32::<LittleEndian>()?;
+    if input_len > max_input_bytes {
+        return Err(anyhow!(
+            "file size {} exceeds helper input cap {} bytes",
+            input_len,
+            max_input_bytes
+        ));
+    }
+    let len = usize::try_from(input_len)
+        .map_err(|_| anyhow!("file too large to snapshot into memory on this platform"))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(len)
+        .map_err(|e| anyhow!("failed to reserve helper snapshot ({len} bytes): {e}"))?;
+    bytes.resize(len, 0);
+    reader.read_exact(&mut bytes)?;
+    if bytes.len() < 4 {
+        return Err(anyhow!("invalid file magic"));
+    }
+    let byte_le = i32::from_le_bytes(bytes[0..4].try_into().unwrap());
     match byte_le {
         FILE_MAGIC_GGML => Err(anyhow!("unsupport ggml format")),
         FILE_MAGIC_GGMF => Err(anyhow!("unsupport ggmf format")),
         FILE_MAGIC_GGJT => Err(anyhow!("unsupport ggjt format")),
         FILE_MAGIC_GGLA => Err(anyhow!("unsupport ggla format")),
-        FILE_MAGIC_GGUF_LE => {
-            Ok(GGUFContainer::new(ByteOrder::LE, Box::new(reader), max_array_size)
-                .with_input_len(input_len))
-        }
-        FILE_MAGIC_GGUF_BE => {
-            Ok(GGUFContainer::new(ByteOrder::BE, Box::new(reader), max_array_size)
+        FILE_MAGIC_GGUF_LE | FILE_MAGIC_GGUF_BE => {
+            let byte_order = if byte_le == FILE_MAGIC_GGUF_LE {
+                ByteOrder::LE
+            } else {
+                ByteOrder::BE
+            };
+            let mut cursor = std::io::Cursor::new(bytes);
+            use std::io::Seek;
+            cursor.seek(std::io::SeekFrom::Start(4))?;
+            Ok(GGUFContainer::new(byte_order, Box::new(cursor), max_array_size)
                 .with_input_len(input_len))
         }
         _ => Err(anyhow!("invalid file magic")),
@@ -1775,6 +1876,20 @@ mod tests {
     }
 
     #[test]
+    fn rejects_alignment_not_multiple_of_eight() {
+        let bytes = build_v3(
+            &[TestKv::U64("general.alignment", 10)],
+            &[TestTensor {
+                name: "t",
+                dims: &[1],
+                kind: 0,
+                offset: 0,
+            }],
+        );
+        assert!(decode_bytes(bytes).is_err());
+    }
+
+    #[test]
     fn rejects_overlapping_tensor_ranges() {
         let bytes = build_v3(
             &[],
@@ -1821,10 +1936,105 @@ mod tests {
     }
 
     #[test]
+    fn rejects_duplicate_metadata_keys() {
+        let mut bytes = empty_v3(0, 2);
+        push_string(&mut bytes, "dup");
+        bytes.extend_from_slice(&10u32.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        push_string(&mut bytes, "dup");
+        bytes.extend_from_slice(&10u32.to_le_bytes());
+        bytes.extend_from_slice(&2u64.to_le_bytes());
+        assert!(decode_bytes(bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_tensor_names() {
+        let bytes = build_v3(
+            &[],
+            &[
+                TestTensor {
+                    name: "dup",
+                    dims: &[1],
+                    kind: 0,
+                    offset: 0,
+                },
+                TestTensor {
+                    name: "dup",
+                    dims: &[1],
+                    kind: 0,
+                    offset: 4,
+                },
+            ],
+        );
+        assert!(decode_bytes(bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_utf8_in_strings() {
+        use std::io::Cursor;
+        let mut bytes = empty_v3(0, 1);
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.push(0xff);
+        bytes.extend_from_slice(&10u32.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        let len = bytes.len() as u64;
+        let cursor = Cursor::new(bytes);
+        let mut container = super::GGUFContainer::new(super::ByteOrder::LE, Box::new(cursor), 3)
+            .with_input_len(len);
+        assert!(container.decode().is_err());
+    }
+
+    #[test]
+    fn direct_new_requires_explicit_input_policy() {
+        use std::io::Cursor;
+        let bytes = empty_v3(0, 0);
+        let cursor = Cursor::new(bytes);
+        let mut container = super::GGUFContainer::new(super::ByteOrder::LE, Box::new(cursor), 3);
+        assert!(container.decode().is_err());
+    }
+
+    #[test]
+    fn allow_unbounded_input_opt_in_restores_streaming_decode() {
+        use std::io::Cursor;
+        let bytes = empty_v3(0, 0);
+        let cursor = Cursor::new(bytes);
+        let mut container = super::GGUFContainer::new(super::ByteOrder::LE, Box::new(cursor), 3)
+            .allow_unbounded_input();
+        assert!(container.decode().is_ok());
+    }
+
+    #[test]
     fn malformed_file_type_does_not_panic() {
         let bytes = build_v3(&[TestKv::StrLen("general.file_type", 0)], &[]);
         let model = decode_bytes(bytes).unwrap();
         assert_eq!(model.file_type(), "unknown");
+    }
+
+    #[test]
+    fn stored_array_items_are_capped_even_for_large_requests() {
+        let n = super::MAX_STORED_ARRAY_ITEMS + 10;
+        let mut bytes = empty_v3(0, 1);
+        push_string(&mut bytes, "big.tokens");
+        bytes.extend_from_slice(&9u32.to_le_bytes());
+        bytes.extend_from_slice(&10u32.to_le_bytes());
+        bytes.extend_from_slice(&n.to_le_bytes());
+        for i in 0..n {
+            bytes.extend_from_slice(&i.to_le_bytes());
+        }
+
+        let len = bytes.len() as u64;
+        let cursor = std::io::Cursor::new(bytes);
+        let mut container =
+            super::GGUFContainer::new(super::ByteOrder::LE, Box::new(cursor), u64::MAX)
+                .with_input_len(len);
+        let model = container.decode().unwrap();
+        let arr = model
+            .metadata()
+            .get("big.tokens")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(arr.len(), super::MAX_STORED_ARRAY_ITEMS as usize);
     }
 }
 
