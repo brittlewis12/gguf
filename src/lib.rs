@@ -247,10 +247,8 @@ impl GGUFContainer {
     ///
     /// This is a low-level constructor. For checked decoding of untrusted
     /// inputs, callers should also provide the total input length via
-    /// [`GGUFContainer::with_input_len`]. Callers that intentionally want to
-    /// parse an unbounded/trusted stream must opt in explicitly with
-    /// [`GGUFContainer::allow_unbounded_input`]. File-backed helpers in this
-    /// crate set the input length automatically.
+    /// [`GGUFContainer::with_input_len`]. File-backed helpers in this crate
+    /// set the input length automatically.
     ///
     /// # Arguments
     ///
@@ -291,9 +289,9 @@ impl GGUFContainer {
 
     /// Explicitly opt into decoding a trusted unbounded reader.
     ///
-    /// This disables EOF-based tensor range validation. Prefer
-    /// [`GGUFContainer::with_input_len`] for untrusted inputs.
-    pub fn allow_unbounded_input(mut self) -> Self {
+    /// This disables EOF-based tensor range validation and is kept crate-local
+    /// so external users cannot accidentally bypass checked parsing.
+    pub(crate) fn allow_unbounded_input(mut self) -> Self {
         self.input_bounds = InputBounds::TrustedUnbounded;
         self
     }
@@ -318,9 +316,8 @@ impl GGUFContainer {
     /// - The file has an invalid or unsupported GGUF version
     /// - The file contains malformed data
     /// - An I/O error occurs while reading
-    /// - The caller used [`GGUFContainer::new`] without either
-    ///   [`GGUFContainer::with_input_len`] or
-    ///   [`GGUFContainer::allow_unbounded_input`]
+    /// - The caller used [`GGUFContainer::new`] without
+    ///   [`GGUFContainer::with_input_len`]
     ///
     /// # Examples
     ///
@@ -334,7 +331,7 @@ impl GGUFContainer {
     pub fn decode(&mut self) -> Result<GGUFModel> {
         if matches!(self.input_bounds, InputBounds::Unknown) {
             return Err(anyhow!(
-                "input length is required for checked decoding; use with_input_len(...) or explicitly opt into allow_unbounded_input()"
+                "input length is required for checked decoding; use with_input_len(...) or a file-backed helper"
             ));
         }
 

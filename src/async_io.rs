@@ -143,6 +143,9 @@ impl AsyncGGUF {
                     max_input_bytes
                 ));
             }
+            if input_len < 4 {
+                return Err(anyhow!("file too small to be a valid GGUF file"));
+            }
             let mut magic = [0u8; 4];
             file.read_exact(&mut magic)?;
             let actual_byte_order = match i32::from_le_bytes(magic) {
