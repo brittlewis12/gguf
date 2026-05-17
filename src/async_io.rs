@@ -82,6 +82,17 @@ impl AsyncGGUF {
         }
 
         let mut file = File::open(path).await?;
+        let input_len = file.metadata().await?.len();
+        if input_len > max_input_bytes {
+            return Err(anyhow!(
+                "file size {} exceeds async input cap {} bytes",
+                input_len,
+                max_input_bytes
+            ));
+        }
+        if input_len < 4 {
+            return Err(anyhow!("file too small to be a valid GGUF file"));
+        }
 
         // Read magic number
         let mut magic_bytes = [0u8; 4];
@@ -166,11 +177,9 @@ impl AsyncGGUF {
             ) {
                 return Err(anyhow!("GGUF file changed between open() and decode()"));
             }
-            let mut cursor = std::io::Cursor::new(bytes);
-            cursor.seek(std::io::SeekFrom::Start(4))?;
-            let mut container =
-                crate::GGUFContainer::new(actual_byte_order, Box::new(cursor), max_array_size)
-                    .with_input_len(input_len);
+            let cursor = std::io::Cursor::new(bytes);
+            let mut container = crate::GGUFContainer::new(Box::new(cursor), max_array_size)?
+                .with_input_len(input_len);
             container.decode()
         })
         .await
@@ -240,10 +249,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_async_input_limit_is_enforced() {
-        let container = AsyncGGUF::open_with_limits("tests/test-le-v3.gguf", 3, 1).await;
-        assert!(container.is_ok());
-        let mut container = container.unwrap();
-        let result = container.decode().await;
+        let result = AsyncGGUF::open_with_limits("tests/test-le-v3.gguf", 3, 1).await;
         assert!(result.is_err());
     }
 }

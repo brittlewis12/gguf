@@ -30,7 +30,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::{ByteOrder, GGUFModel, FILE_MAGIC_GGUF_BE, FILE_MAGIC_GGUF_LE};
+use crate::{GGUFModel, FILE_MAGIC_GGUF_BE, FILE_MAGIC_GGUF_LE};
 
 const DEFAULT_MAX_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -117,6 +117,13 @@ impl MmapGGUF {
             return Err(anyhow!("file too small to be a valid GGUF file"));
         }
 
+        let mut magic = [0u8; 4];
+        file.read_exact(&mut magic)?;
+        match i32::from_le_bytes(magic) {
+            FILE_MAGIC_GGUF_LE | FILE_MAGIC_GGUF_BE => {}
+            _ => return Err(anyhow!("invalid file magic: not a GGUF file")),
+        }
+
         let mmap = if file_len == 0 {
             Arc::new(MmapMut::map_anon(0)?.make_read_only()?)
         } else {
@@ -128,20 +135,12 @@ impl MmapGGUF {
             Arc::new(snapshot.make_read_only()?)
         };
 
-        let magic = i32::from_le_bytes([mmap[0], mmap[1], mmap[2], mmap[3]]);
-
-        let byte_order = match magic {
-            FILE_MAGIC_GGUF_LE => ByteOrder::LE,
-            FILE_MAGIC_GGUF_BE => ByteOrder::BE,
-            _ => return Err(anyhow!("invalid file magic: not a GGUF file")),
-        };
-
         let reader = MmapReader {
             mmap: Arc::clone(&mmap),
-            pos: 4,
+            pos: 0,
         };
-        let mut container = crate::GGUFContainer::new(byte_order, Box::new(reader), max_array_size)
-            .with_input_len(file_len);
+        let mut container =
+            crate::GGUFContainer::new(Box::new(reader), max_array_size)?.with_input_len(file_len);
         let model = container.decode()?;
 
         Ok(Self { mmap, model })

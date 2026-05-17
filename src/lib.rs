@@ -254,21 +254,27 @@ impl GGUFContainer {
     ///
     /// # Arguments
     ///
-    /// * `bo` - Byte order (little-endian or big-endian)
     /// * `reader` - A reader implementing `std::io::Read`
     /// * `max_array_size` - Maximum size for array metadata values
     ///
     /// # Example
     ///
     /// ```rust,no_run
-    /// use gguf_rs::{GGUFContainer, ByteOrder};
+    /// use gguf_rs::GGUFContainer;
     /// use std::fs::File;
     ///
     /// let file = File::open("model.gguf")?;
-    /// let container = GGUFContainer::new(ByteOrder::LE, Box::new(file), 1024);
+    /// let container = GGUFContainer::new(Box::new(file), 1024)?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn new(bo: ByteOrder, reader: Box<dyn std::io::Read>, max_array_size: u64) -> Self {
+    pub fn new(mut reader: Box<dyn std::io::Read>, max_array_size: u64) -> Result<Self> {
+        let mut magic = [0u8; 4];
+        reader.read_exact(&mut magic)?;
+        let bo = detect_magic(magic)?;
+        Ok(Self::new_after_magic(bo, reader, max_array_size))
+    }
+
+    fn new_after_magic(bo: ByteOrder, reader: Box<dyn std::io::Read>, max_array_size: u64) -> Self {
         Self {
             bo,
             version: Version::V1(V1::default()),
@@ -332,10 +338,35 @@ impl GGUFContainer {
             ));
         }
 
-        let version = match self.bo {
-            ByteOrder::LE => self.reader.read_i32::<LittleEndian>()?,
-            ByteOrder::BE => self.reader.read_i32::<BigEndian>()?,
+        let input_bounds = self.input_bounds;
+        let mut reader = std::mem::replace(&mut self.reader, Box::new(std::io::empty()));
+        let remaining_after_magic = match input_bounds {
+            InputBounds::Known(total_len) => total_len
+                .checked_sub(4)
+                .ok_or_else(|| anyhow!("input length {total_len} is smaller than GGUF magic"))?,
+            InputBounds::TrustedUnbounded => 0,
+            InputBounds::Unknown => unreachable!(),
         };
+
+        let version = match self.bo {
+            ByteOrder::LE => {
+                if matches!(input_bounds, InputBounds::Known(_)) {
+                    BoundedReader::new(&mut reader, remaining_after_magic)
+                        .read_i32::<LittleEndian>()?
+                } else {
+                    reader.read_i32::<LittleEndian>()?
+                }
+            }
+            ByteOrder::BE => {
+                if matches!(input_bounds, InputBounds::Known(_)) {
+                    BoundedReader::new(&mut reader, remaining_after_magic)
+                        .read_i32::<BigEndian>()?
+                } else {
+                    reader.read_i32::<BigEndian>()?
+                }
+            }
+        };
+        let remaining_after_version = remaining_after_magic.saturating_sub(4);
 
         #[cfg(feature = "debug")]
         {
@@ -346,8 +377,22 @@ impl GGUFContainer {
             GGUF_VERSION_V1 => {
                 let mut buffer: [u32; 2] = [0; 2];
                 match self.bo {
-                    ByteOrder::LE => self.reader.read_u32_into::<LittleEndian>(&mut buffer)?,
-                    ByteOrder::BE => self.reader.read_u32_into::<BigEndian>(&mut buffer)?,
+                    ByteOrder::LE => {
+                        if matches!(input_bounds, InputBounds::Known(_)) {
+                            BoundedReader::new(&mut reader, remaining_after_version)
+                                .read_u32_into::<LittleEndian>(&mut buffer)?
+                        } else {
+                            reader.read_u32_into::<LittleEndian>(&mut buffer)?
+                        }
+                    }
+                    ByteOrder::BE => {
+                        if matches!(input_bounds, InputBounds::Known(_)) {
+                            BoundedReader::new(&mut reader, remaining_after_version)
+                                .read_u32_into::<BigEndian>(&mut buffer)?
+                        } else {
+                            reader.read_u32_into::<BigEndian>(&mut buffer)?
+                        }
+                    }
                 };
 
                 self.version = Version::V1(V1 {
@@ -358,8 +403,22 @@ impl GGUFContainer {
             GGUF_VERSION_V2 | GGUF_VERSION_V3 => {
                 let mut buffer: [u64; 2] = [0; 2];
                 match self.bo {
-                    ByteOrder::LE => self.reader.read_u64_into::<LittleEndian>(&mut buffer)?,
-                    ByteOrder::BE => self.reader.read_u64_into::<BigEndian>(&mut buffer)?,
+                    ByteOrder::LE => {
+                        if matches!(input_bounds, InputBounds::Known(_)) {
+                            BoundedReader::new(&mut reader, remaining_after_version)
+                                .read_u64_into::<LittleEndian>(&mut buffer)?
+                        } else {
+                            reader.read_u64_into::<LittleEndian>(&mut buffer)?
+                        }
+                    }
+                    ByteOrder::BE => {
+                        if matches!(input_bounds, InputBounds::Known(_)) {
+                            BoundedReader::new(&mut reader, remaining_after_version)
+                                .read_u64_into::<BigEndian>(&mut buffer)?
+                        } else {
+                            reader.read_u64_into::<BigEndian>(&mut buffer)?
+                        }
+                    }
                 };
 
                 if version == GGUF_VERSION_V2 {
@@ -386,6 +445,7 @@ impl GGUFContainer {
 
         let mut model = GGUFModel {
             kv: BTreeMap::new(),
+            kv_types: BTreeMap::new(),
             tensors: Vec::new(),
             parameters: 0,
             max_array_size: self.max_array_size,
@@ -398,7 +458,20 @@ impl GGUFContainer {
             Version::V2(_) | Version::V3(_) => 4 + 4 + 8 + 8,
         } as u64;
 
-        model.decode(&mut self.reader, self.input_bounds, header_preamble_len)?;
+        let remaining_after_container_header = match input_bounds {
+            InputBounds::Known(total_len) => total_len
+                .checked_sub(header_preamble_len)
+                .ok_or_else(|| anyhow!("input length {total_len} is smaller than GGUF header"))?,
+            InputBounds::TrustedUnbounded => 0,
+            InputBounds::Unknown => unreachable!(),
+        };
+
+        if let InputBounds::Known(_) = input_bounds {
+            let bounded = BoundedReader::new(reader, remaining_after_container_header);
+            model.decode(bounded, input_bounds, header_preamble_len)?;
+        } else {
+            model.decode(reader, input_bounds, header_preamble_len)?;
+        }
         Ok(model)
     }
 
@@ -470,6 +543,7 @@ pub struct Tensor {
 /// ```
 pub struct GGUFModel {
     kv: BTreeMap<String, Value>,
+    kv_types: BTreeMap<String, MetadataValueType>,
     tensors: Vec<Tensor>,
     parameters: u64,
     max_array_size: u64,
@@ -481,7 +555,7 @@ pub struct GGUFModel {
 ///
 /// Represents the type of a metadata value in the key-value store.
 /// Used when decoding metadata to determine how to interpret bytes.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetadataValueType {
     Uint8 = 0,
     Int8 = 1,
@@ -678,6 +752,14 @@ fn validate_counts(num_tensors: u64, num_kv: u64) -> Result<()> {
     Ok(())
 }
 
+fn detect_magic(magic: [u8; 4]) -> Result<ByteOrder> {
+    match i32::from_le_bytes(magic) {
+        FILE_MAGIC_GGUF_LE => Ok(ByteOrder::LE),
+        FILE_MAGIC_GGUF_BE => Ok(ByteOrder::BE),
+        _ => Err(anyhow!("invalid file magic: not a GGUF file")),
+    }
+}
+
 fn value_as_u64(v: &Value) -> Option<u64> {
     v.as_u64()
         .or_else(|| v.as_i64().and_then(|i| u64::try_from(i).ok()))
@@ -769,6 +851,29 @@ impl<R: std::io::Read> std::io::Read for CountingReader<R> {
     }
 }
 
+struct BoundedReader<R> {
+    inner: R,
+    remaining: u64,
+}
+
+impl<R> BoundedReader<R> {
+    fn new(inner: R, remaining: u64) -> Self {
+        Self { inner, remaining }
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for BoundedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            return Ok(0);
+        }
+        let n = usize::try_from(self.remaining.min(buf.len() as u64)).unwrap();
+        let read = self.inner.read(&mut buf[..n])?;
+        self.remaining -= read as u64;
+        Ok(read)
+    }
+}
+
 impl GGUFModel {
     /// Decode the GGUF file.
     pub(crate) fn decode(
@@ -812,6 +917,7 @@ impl GGUFModel {
             {
                 debug!("kv [{}] vtype {:?} key={}, value={}", _i, value_type, key, value);
             }
+            self.kv_types.insert(key.clone(), value_type);
             self.kv.insert(key, value);
             if reader.bytes_read() > MAX_METADATA_BYTES {
                 return Err(anyhow!("metadata section exceeds cap {} bytes", MAX_METADATA_BYTES));
@@ -856,9 +962,10 @@ impl GGUFModel {
             let offset = self.read_u64(&mut reader)?;
             let ggml_type_kind: GGMLType = kind.try_into()?;
             let (block_size, type_size) = ggml_type_layout(ggml_type_kind)?;
-            if elements % block_size != 0 {
+            let row_elems = shape[0];
+            if row_elems % block_size != 0 {
                 return Err(anyhow!(
-                    "tensor {name:?} element count {elements} is not divisible by block size {block_size}"
+                    "tensor {name:?} row width {row_elems} is not divisible by block size {block_size}"
                 ));
             }
             if offset % alignment != 0 {
@@ -867,9 +974,16 @@ impl GGUFModel {
                 ));
             }
 
-            let size = elements
+            let row_count = shape[1]
+                .checked_mul(shape[2])
+                .and_then(|v| v.checked_mul(shape[3]))
+                .ok_or_else(|| anyhow!("tensor {name:?} row count overflows u64"))?;
+            let row_size = row_elems
                 .checked_div(block_size)
                 .and_then(|blocks| blocks.checked_mul(type_size))
+                .ok_or_else(|| anyhow!("tensor {name:?} byte size overflows u64"))?;
+            let size = row_size
+                .checked_mul(row_count)
                 .ok_or_else(|| anyhow!("tensor {name:?} byte size overflows u64"))?;
 
             self.tensors.push(Tensor {
@@ -905,11 +1019,22 @@ impl GGUFModel {
     }
 
     fn alignment(&self) -> Result<u64> {
-        let raw = self
-            .kv
-            .get("general.alignment")
-            .and_then(value_as_u64)
-            .unwrap_or(GGUF_DEFAULT_ALIGNMENT);
+        let raw = match self.kv.get("general.alignment") {
+            Some(v) => {
+                match self.kv_types.get("general.alignment") {
+                    Some(
+                        MetadataValueType::Uint8
+                        | MetadataValueType::Uint16
+                        | MetadataValueType::Uint32
+                        | MetadataValueType::Uint64,
+                    ) => {}
+                    _ => return Err(anyhow!("general.alignment is missing or has invalid type")),
+                }
+                value_as_u64(v)
+                    .ok_or_else(|| anyhow!("general.alignment is missing or has invalid type"))?
+            }
+            None => GGUF_DEFAULT_ALIGNMENT,
+        };
         if raw == 0 {
             return Err(anyhow!("general.alignment is 0"));
         }
@@ -1326,6 +1451,11 @@ pub fn get_gguf_container_array_size_with_limit(
             max_input_bytes
         ));
     }
+    let mut magic = [0u8; 4];
+    reader.read_exact(&mut magic)?;
+    detect_magic(magic)?;
+    use std::io::Seek;
+    reader.seek(std::io::SeekFrom::Start(0))?;
     let len = usize::try_from(input_len)
         .map_err(|_| anyhow!("file too large to snapshot into memory on this platform"))?;
     let mut bytes = Vec::new();
@@ -1334,29 +1464,8 @@ pub fn get_gguf_container_array_size_with_limit(
         .map_err(|e| anyhow!("failed to reserve helper snapshot ({len} bytes): {e}"))?;
     bytes.resize(len, 0);
     reader.read_exact(&mut bytes)?;
-    if bytes.len() < 4 {
-        return Err(anyhow!("invalid file magic"));
-    }
-    let byte_le = i32::from_le_bytes(bytes[0..4].try_into().unwrap());
-    match byte_le {
-        FILE_MAGIC_GGML => Err(anyhow!("unsupport ggml format")),
-        FILE_MAGIC_GGMF => Err(anyhow!("unsupport ggmf format")),
-        FILE_MAGIC_GGJT => Err(anyhow!("unsupport ggjt format")),
-        FILE_MAGIC_GGLA => Err(anyhow!("unsupport ggla format")),
-        FILE_MAGIC_GGUF_LE | FILE_MAGIC_GGUF_BE => {
-            let byte_order = if byte_le == FILE_MAGIC_GGUF_LE {
-                ByteOrder::LE
-            } else {
-                ByteOrder::BE
-            };
-            let mut cursor = std::io::Cursor::new(bytes);
-            use std::io::Seek;
-            cursor.seek(std::io::SeekFrom::Start(4))?;
-            Ok(GGUFContainer::new(byte_order, Box::new(cursor), max_array_size)
-                .with_input_len(input_len))
-        }
-        _ => Err(anyhow!("invalid file magic")),
-    }
+    let cursor = std::io::Cursor::new(bytes);
+    Ok(GGUFContainer::new(Box::new(cursor), max_array_size)?.with_input_len(input_len))
 }
 
 #[cfg(test)]
@@ -1372,8 +1481,9 @@ mod tests {
         use std::io::Cursor;
         let len = bytes.len() as u64;
         let cursor = Cursor::new(bytes);
-        let mut container = super::GGUFContainer::new(super::ByteOrder::LE, Box::new(cursor), 3)
-            .with_input_len(len);
+        let mut container =
+            super::GGUFContainer::new_after_magic(super::ByteOrder::LE, Box::new(cursor), 3)
+                .with_input_len(len + 4);
         container.decode()
     }
 
@@ -1407,6 +1517,7 @@ mod tests {
 
     enum TestKv<'a> {
         U64(&'a str, u64),
+        I64(&'a str, i64),
         StrLen(&'a str, u64),
         Bool(&'a str, u8),
     }
@@ -1425,6 +1536,11 @@ mod tests {
                 TestKv::U64(key, value) => {
                     push_string(&mut b, key);
                     b.extend_from_slice(&10u32.to_le_bytes());
+                    b.extend_from_slice(&value.to_le_bytes());
+                }
+                TestKv::I64(key, value) => {
+                    push_string(&mut b, key);
+                    b.extend_from_slice(&11u32.to_le_bytes());
                     b.extend_from_slice(&value.to_le_bytes());
                 }
                 TestKv::StrLen(key, len) => {
@@ -1507,9 +1623,7 @@ mod tests {
         use std::io::Cursor;
         let invalid_data = vec![0x00, 0x00, 0x00, 0x00];
         let cursor = Cursor::new(invalid_data);
-        let mut container =
-            super::GGUFContainer::new(super::ByteOrder::LE, Box::new(cursor), u64::MAX);
-        let result = container.decode();
+        let result = super::GGUFContainer::new(Box::new(cursor), u64::MAX);
         assert!(result.is_err());
     }
 
@@ -1708,12 +1822,14 @@ mod tests {
 
     #[test]
     fn test_container_new() {
-        use super::{ByteOrder, GGUFContainer};
+        use super::GGUFContainer;
         use std::io::Cursor;
 
-        let cursor = Cursor::new(vec![]);
-        let container = GGUFContainer::new(ByteOrder::LE, Box::new(cursor), 100);
-        assert_eq!(container.get_version(), "v1"); // Default version
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&super::FILE_MAGIC_GGUF_LE.to_le_bytes());
+        let cursor = Cursor::new(bytes);
+        let container = GGUFContainer::new(Box::new(cursor), 100).unwrap();
+        assert_eq!(container.get_version(), "v1");
     }
 
     #[test]
@@ -1755,9 +1871,7 @@ mod tests {
 
         for magic in invalid_magics {
             let cursor = Cursor::new(magic);
-            let mut container =
-                super::GGUFContainer::new(super::ByteOrder::LE, Box::new(cursor), u64::MAX);
-            let result = container.decode();
+            let result = super::GGUFContainer::new(Box::new(cursor), u64::MAX);
             assert!(result.is_err(), "Expected error for invalid magic");
         }
     }
@@ -1817,6 +1931,11 @@ mod tests {
     #[test]
     fn rejects_bad_quant_block_alignment() {
         assert!(decode_bytes(one_tensor_v3("t", &[1], 12, 0)).is_err());
+    }
+
+    #[test]
+    fn rejects_bad_quant_row_width_even_when_total_elements_align() {
+        assert!(decode_bytes(one_tensor_v3("t", &[1, 256], 12, 0)).is_err());
     }
 
     #[test]
@@ -1890,6 +2009,34 @@ mod tests {
     }
 
     #[test]
+    fn rejects_alignment_wrong_type() {
+        let bytes = build_v3(
+            &[TestKv::StrLen("general.alignment", 0)],
+            &[TestTensor {
+                name: "t",
+                dims: &[1],
+                kind: 0,
+                offset: 0,
+            }],
+        );
+        assert!(decode_bytes(bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_alignment_signed_integer_type() {
+        let bytes = build_v3(
+            &[TestKv::I64("general.alignment", 16)],
+            &[TestTensor {
+                name: "t",
+                dims: &[1],
+                kind: 0,
+                offset: 0,
+            }],
+        );
+        assert!(decode_bytes(bytes).is_err());
+    }
+
+    #[test]
     fn rejects_overlapping_tensor_ranges() {
         let bytes = build_v3(
             &[],
@@ -1930,8 +2077,9 @@ mod tests {
 
         let len = bytes.len() as u64;
         let cursor = Cursor::new(bytes);
-        let mut container = super::GGUFContainer::new(super::ByteOrder::LE, Box::new(cursor), 1)
-            .with_input_len(len);
+        let mut container =
+            super::GGUFContainer::new_after_magic(super::ByteOrder::LE, Box::new(cursor), 1)
+                .with_input_len(len + 4);
         assert!(container.decode().is_err());
     }
 
@@ -1979,26 +2127,36 @@ mod tests {
         bytes.extend_from_slice(&1u64.to_le_bytes());
         let len = bytes.len() as u64;
         let cursor = Cursor::new(bytes);
-        let mut container = super::GGUFContainer::new(super::ByteOrder::LE, Box::new(cursor), 3)
-            .with_input_len(len);
+        let mut container =
+            super::GGUFContainer::new_after_magic(super::ByteOrder::LE, Box::new(cursor), 3)
+                .with_input_len(len + 4);
         assert!(container.decode().is_err());
     }
 
     #[test]
     fn direct_new_requires_explicit_input_policy() {
         use std::io::Cursor;
-        let bytes = empty_v3(0, 0);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&super::FILE_MAGIC_GGUF_LE.to_le_bytes());
+        bytes.extend_from_slice(&super::GGUF_VERSION_V3.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
         let cursor = Cursor::new(bytes);
-        let mut container = super::GGUFContainer::new(super::ByteOrder::LE, Box::new(cursor), 3);
+        let mut container = super::GGUFContainer::new(Box::new(cursor), 3).unwrap();
         assert!(container.decode().is_err());
     }
 
     #[test]
     fn allow_unbounded_input_opt_in_restores_streaming_decode() {
         use std::io::Cursor;
-        let bytes = empty_v3(0, 0);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&super::FILE_MAGIC_GGUF_LE.to_le_bytes());
+        bytes.extend_from_slice(&super::GGUF_VERSION_V3.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
         let cursor = Cursor::new(bytes);
-        let mut container = super::GGUFContainer::new(super::ByteOrder::LE, Box::new(cursor), 3)
+        let mut container = super::GGUFContainer::new(Box::new(cursor), 3)
+            .unwrap()
             .allow_unbounded_input();
         assert!(container.decode().is_ok());
     }
@@ -2025,8 +2183,8 @@ mod tests {
         let len = bytes.len() as u64;
         let cursor = std::io::Cursor::new(bytes);
         let mut container =
-            super::GGUFContainer::new(super::ByteOrder::LE, Box::new(cursor), u64::MAX)
-                .with_input_len(len);
+            super::GGUFContainer::new_after_magic(super::ByteOrder::LE, Box::new(cursor), u64::MAX)
+                .with_input_len(len + 4);
         let model = container.decode().unwrap();
         let arr = model
             .metadata()
