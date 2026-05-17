@@ -28,7 +28,7 @@
 
 use anyhow::{anyhow, Result};
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::AsyncReadExt;
 
 use crate::{ByteOrder, GGUFModel, FILE_MAGIC_GGUF_BE, FILE_MAGIC_GGUF_LE};
 
@@ -36,8 +36,8 @@ use crate::{ByteOrder, GGUFModel, FILE_MAGIC_GGUF_BE, FILE_MAGIC_GGUF_LE};
 ///
 /// Provides async access to GGUF files using tokio.
 pub struct AsyncGGUF {
+    file: std::fs::File,
     byte_order: ByteOrder,
-    reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
     max_array_size: u64,
 }
 
@@ -83,14 +83,11 @@ impl AsyncGGUF {
             _ => return Err(anyhow!("invalid file magic: not a GGUF file")),
         };
 
-        // Seek back to start (after magic)
-        // We'll re-read from beginning in decode()
-        let boxed_reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> =
-            Box::new(tokio::io::BufReader::new(file));
+        let std_file = file.into_std().await;
 
         Ok(Self {
+            file: std_file,
             byte_order,
-            reader: Box::new(MagicSkippedReader(boxed_reader)),
             max_array_size: 3,
         })
     }
@@ -107,31 +104,34 @@ impl AsyncGGUF {
     ///
     /// Returns an error if the file contains malformed data.
     pub async fn decode(&mut self) -> Result<GGUFModel> {
-        // For now, we use a synchronous approach with the async reader
-        // A fully async implementation would require more complex state machine
-        let mut all_data = Vec::new();
-        self.reader.read_to_end(&mut all_data).await?;
-
-        let cursor = std::io::Cursor::new(all_data);
-        let mut container = crate::GGUFContainer::new(
-            self.byte_order.clone(),
-            Box::new(cursor),
-            self.max_array_size,
-        );
-        container.decode()
-    }
-}
-
-/// Wrapper to skip the magic bytes already read
-struct MagicSkippedReader(Box<dyn tokio::io::AsyncRead + Unpin + Send>);
-
-impl tokio::io::AsyncRead for MagicSkippedReader {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+        let file = self.file.try_clone()?;
+        let expected_byte_order = self.byte_order.clone();
+        let max_array_size = self.max_array_size;
+        tokio::task::spawn_blocking(move || -> Result<GGUFModel> {
+            let mut file = file;
+            use std::io::{Read, Seek, SeekFrom};
+            file.seek(SeekFrom::Start(0))?;
+            let input_len = file.metadata()?.len();
+            let mut magic = [0u8; 4];
+            file.read_exact(&mut magic)?;
+            let actual_byte_order = match i32::from_le_bytes(magic) {
+                FILE_MAGIC_GGUF_LE => ByteOrder::LE,
+                FILE_MAGIC_GGUF_BE => ByteOrder::BE,
+                _ => return Err(anyhow!("invalid file magic: not a GGUF file")),
+            };
+            if !matches!(
+                (&expected_byte_order, &actual_byte_order),
+                (ByteOrder::LE, ByteOrder::LE) | (ByteOrder::BE, ByteOrder::BE)
+            ) {
+                return Err(anyhow!("GGUF file changed between open() and decode()"));
+            }
+            let mut container =
+                crate::GGUFContainer::new(actual_byte_order, Box::new(file), max_array_size)
+                    .with_input_len(input_len);
+            container.decode()
+        })
+        .await
+        .map_err(|e| anyhow!("async GGUF decode task failed: {e}"))?
     }
 }
 

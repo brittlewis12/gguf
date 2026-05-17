@@ -70,7 +70,8 @@
 //! use gguf_rs::mmap::MmapGGUF;
 //!
 //! let mmap = MmapGGUF::open("large_model.gguf")?;
-//! let model = mmap.decode()?;
+//! let model = mmap.model();
+//! println!("{}", model.model_family());
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
@@ -123,6 +124,17 @@ pub const GGUF_VERSION_V3: i32 = 0x00000003;
 const THOUSAND: u64 = 1000;
 const MILLION: u64 = 1_000_000;
 const BILLION: u64 = 1_000_000_000;
+
+const GGUF_DEFAULT_ALIGNMENT: u64 = 32;
+const MAX_ALIGNMENT: u64 = 65536;
+const MAX_TENSORS: u64 = 1_000_000;
+const MAX_KV: u64 = 1_000_000;
+const MAX_METADATA_KEY_LEN: u64 = 65535;
+const MAX_TENSOR_NAME_LEN: u64 = 64;
+const MAX_STRING_VALUE_LEN: u64 = 100 * 1024 * 1024;
+const MAX_ARRAY_LEN: u64 = 10_000_000;
+const MAX_DIMENSION: u64 = 1u64 << 30;
+const MAX_ELEMENTS: u64 = 1u64 << 40;
 
 /// Convert a number to a human-readable string.
 fn human_number(value: u64) -> String {
@@ -216,6 +228,7 @@ pub struct GGUFContainer {
     version: Version,
     reader: Box<dyn std::io::Read + 'static>,
     max_array_size: u64,
+    input_len: Option<u64>,
 }
 
 impl GGUFContainer {
@@ -243,7 +256,13 @@ impl GGUFContainer {
             version: Version::V1(V1::default()),
             reader,
             max_array_size,
+            input_len: None,
         }
+    }
+
+    pub fn with_input_len(mut self, input_len: u64) -> Self {
+        self.input_len = Some(input_len);
+        self
     }
 
     /// Get the version of the GGUF file container.
@@ -327,6 +346,8 @@ impl GGUFContainer {
             }
         };
 
+        validate_counts(self.num_tensor(), self.num_kv())?;
+
         let mut model = GGUFModel {
             kv: BTreeMap::new(),
             tensors: Vec::new(),
@@ -336,8 +357,24 @@ impl GGUFContainer {
             version: self.version.clone(),
         };
 
-        model.decode(&mut self.reader)?;
+        model.decode(&mut self.reader, self.input_len)?;
         Ok(model)
+    }
+
+    fn num_kv(&self) -> u64 {
+        match &self.version {
+            Version::V1(v1) => v1.num_kv as u64,
+            Version::V2(v2) => v2.num_kv,
+            Version::V3(v3) => v3.num_kv,
+        }
+    }
+
+    fn num_tensor(&self) -> u64 {
+        match &self.version {
+            Version::V1(v1) => v1.num_tensor as u64,
+            Version::V2(v2) => v2.num_tensor,
+            Version::V3(v3) => v3.num_tensor,
+        }
     }
 }
 
@@ -364,7 +401,7 @@ pub struct Tensor {
     pub name: String,
     /// GGML type identifier (see [`GGMLType`] for interpretation)
     pub kind: u32,
-    /// Byte offset in the file where tensor data begins
+    /// Byte offset relative to the GGUF tensor-data section where this tensor begins
     pub offset: u64,
     /// Size of tensor data in bytes
     pub size: u64,
@@ -585,18 +622,124 @@ impl TryFrom<u32> for GGMLType {
             37 => GGMLType::IQ4_NL_4_8,
             38 => GGMLType::IQ4_NL_8_8,
             39 => GGMLType::MXFP4,
-            40 => GGMLType::Count,
             _ => return Err(anyhow!("invalid GGML type")),
         })
     }
 }
 
+fn validate_counts(num_tensors: u64, num_kv: u64) -> Result<()> {
+    if num_tensors > MAX_TENSORS {
+        return Err(anyhow!("tensor count {num_tensors} exceeds cap {MAX_TENSORS}"));
+    }
+    if num_kv > MAX_KV {
+        return Err(anyhow!("kv count {num_kv} exceeds cap {MAX_KV}"));
+    }
+    Ok(())
+}
+
+fn value_as_u64(v: &Value) -> Option<u64> {
+    v.as_u64()
+        .or_else(|| v.as_i64().and_then(|i| u64::try_from(i).ok()))
+}
+
+fn ggml_type_layout(kind: GGMLType) -> Result<(u64, u64)> {
+    const K: u64 = 256;
+    let (block_size, type_size) = match kind {
+        GGMLType::F32 => (1, 4),
+        GGMLType::F16 => (1, 2),
+        GGMLType::Q4_0 => (32, 2 + 32 / 2),
+        GGMLType::Q4_1 => (32, 2 + 2 + 32 / 2),
+        GGMLType::Q4_2 | GGMLType::Q4_3 => (0, 0),
+        GGMLType::Q5_0 => (32, 2 + 4 + 32 / 2),
+        GGMLType::Q5_1 => (32, 2 + 2 + 4 + 32 / 2),
+        GGMLType::Q8_0 => (32, 2 + 32),
+        GGMLType::Q8_1 => (32, 4 + 4 + 32),
+        GGMLType::Q2_K => (K, K / 16 + K / 4 + 2 + 2),
+        GGMLType::Q3_K => (K, K / 8 + K / 4 + 12 + 2),
+        GGMLType::Q4_K => (K, 2 + 2 + 12 + K / 2),
+        GGMLType::Q5_K => (K, 2 + 2 + 12 + K / 8 + K / 2),
+        GGMLType::Q6_K => (K, K / 2 + K / 4 + K / 16 + 2),
+        GGMLType::Q8_K => (K, 4 + K + K / 16 * 2),
+        GGMLType::IQ2_XXS => (K, 2 + K / 8 * 2),
+        GGMLType::IQ2_XS => (K, 2 + K / 8 * 2 + K / 32),
+        GGMLType::IQ3_XXS => (K, 2 + 3 * (K / 8)),
+        GGMLType::IQ1_S => (K, 2 + K / 8 + K / 16),
+        GGMLType::IQ4_NL => (32, 2 + 16),
+        GGMLType::IQ3_S => (K, 2 + 13 * (K / 32) + K / 64),
+        GGMLType::IQ2_S => (K, 2 + K / 4 + K / 16),
+        GGMLType::IQ4_XS => (K, 2 + 2 + K / 64 + K / 2),
+        GGMLType::I8 => (1, 1),
+        GGMLType::I16 => (1, 2),
+        GGMLType::I32 => (1, 4),
+        GGMLType::I64 => (1, 8),
+        GGMLType::F64 => (1, 8),
+        GGMLType::IQ1_M => (K, K / 8 + K / 16 + K / 32),
+        GGMLType::BF16 => (1, 2),
+        GGMLType::Q4_0_4_4
+        | GGMLType::Q4_0_4_8
+        | GGMLType::Q4_0_8_8
+        | GGMLType::IQ4_NL_4_4
+        | GGMLType::IQ4_NL_4_8
+        | GGMLType::IQ4_NL_8_8 => (0, 0),
+        GGMLType::TQ1_0 => (K, 2 + K / 64 + (K - 4 * (K / 64)) / 5),
+        GGMLType::TQ2_0 => (K, 2 + K / 4),
+        GGMLType::MXFP4 => (32, 17),
+        GGMLType::Count => (0, 0),
+    };
+    if block_size == 0 || type_size == 0 {
+        return Err(anyhow!("unsupported or removed GGML tensor type"));
+    }
+    Ok((block_size, type_size))
+}
+
+fn skip_exact(mut reader: impl std::io::Read, mut len: u64) -> Result<()> {
+    let mut buf = [0u8; 8192];
+    while len > 0 {
+        let n = usize::try_from(len.min(buf.len() as u64)).unwrap();
+        reader.read_exact(&mut buf[..n])?;
+        len -= n as u64;
+    }
+    Ok(())
+}
+
+struct CountingReader<R> {
+    inner: R,
+    bytes_read: u64,
+}
+
+impl<R> CountingReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            bytes_read: 0,
+        }
+    }
+
+    fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.bytes_read = self.bytes_read.saturating_add(n as u64);
+        Ok(n)
+    }
+}
+
 impl GGUFModel {
     /// Decode the GGUF file.
-    pub(crate) fn decode(&mut self, mut reader: impl std::io::Read) -> Result<()> {
+    pub(crate) fn decode(
+        &mut self,
+        reader: impl std::io::Read,
+        input_len: Option<u64>,
+    ) -> Result<()> {
+        let mut reader = CountingReader::new(reader);
         // decode kv
         for _i in 0..self.num_kv() {
-            let key = self.read_string(&mut reader)?;
+            let key =
+                self.read_string_limited(&mut reader, MAX_METADATA_KEY_LEN, "metadata key", false)?;
             let value_type: MetadataValueType = self.read_u32(&mut reader)?.try_into()?;
             let value = match value_type {
                 MetadataValueType::Uint8 => Value::from(self.read_u8(&mut reader)?),
@@ -607,7 +750,12 @@ impl GGUFModel {
                 MetadataValueType::Int32 => Value::from(self.read_i32(&mut reader)?),
                 MetadataValueType::Float32 => Value::from(self.read_f32(&mut reader)?),
                 MetadataValueType::Bool => Value::from(self.read_bool(&mut reader)?),
-                MetadataValueType::String => Value::from(self.read_string(&mut reader)?),
+                MetadataValueType::String => Value::from(self.read_string_limited(
+                    &mut reader,
+                    MAX_STRING_VALUE_LEN,
+                    "metadata string value",
+                    true,
+                )?),
                 MetadataValueType::Array => Value::from(self.read_array(&mut reader)?),
                 MetadataValueType::Uint64 => Value::from(self.read_u64(&mut reader)?),
                 MetadataValueType::Int64 => Value::from(self.read_i64(&mut reader)?),
@@ -620,69 +768,56 @@ impl GGUFModel {
             self.kv.insert(key, value);
         }
 
+        let alignment = self.alignment()?;
+
         // decode tensors
         for _ in 0..self.num_tensor() {
-            let name = self.read_string(&mut reader)?;
+            let name =
+                self.read_string_limited(&mut reader, MAX_TENSOR_NAME_LEN, "tensor name", false)?;
             let dims = self.read_u32(&mut reader)?;
+            if dims == 0 || dims > 4 {
+                return Err(anyhow!("tensor {name:?} declares {dims} dimensions (must be 1..=4)"));
+            }
             let mut shape = [1; 4];
+            let mut elements = 1u64;
             for i in 0..dims {
-                shape[i as usize] = self.read_u64(&mut reader)?;
+                let dim = self.read_u64(&mut reader)?;
+                if dim == 0 {
+                    return Err(anyhow!("tensor {name:?} has a zero-length dimension"));
+                }
+                if dim > MAX_DIMENSION {
+                    return Err(anyhow!("tensor {name:?} dimension {dim} exceeds {MAX_DIMENSION}"));
+                }
+                elements = elements
+                    .checked_mul(dim)
+                    .ok_or_else(|| anyhow!("tensor {name:?} dimension product overflows u64"))?;
+                shape[i as usize] = dim;
+            }
+            if elements > MAX_ELEMENTS {
+                return Err(anyhow!(
+                    "tensor {name:?} element count {elements} exceeds {MAX_ELEMENTS}"
+                ));
             }
 
             let kind = self.read_u32(&mut reader)?;
             let offset = self.read_u64(&mut reader)?;
-            let block_size = match kind {
-                _ if kind < 2 => 1,
-                _ if kind < 10 => 32,
-                _ => 256,
-            };
             let ggml_type_kind: GGMLType = kind.try_into()?;
-            let type_size = match ggml_type_kind {
-                GGMLType::F32 => 4,
-                GGMLType::F16 => 2,
-                GGMLType::Q4_0 => 2 + block_size / 2,
-                GGMLType::Q4_1 => 2 + 2 + block_size / 2,
-                GGMLType::Q4_2 => 0,
-                GGMLType::Q4_3 => 0,
-                GGMLType::Q5_0 => 2 + 4 + block_size / 2,
-                GGMLType::Q5_1 => 2 + 2 + 4 + block_size / 2,
-                GGMLType::Q8_0 => 2 + block_size,
-                GGMLType::Q8_1 => 4 + 4 + block_size,
-                GGMLType::Q2_K => block_size / 16 + block_size / 4 + 2 + 2,
-                GGMLType::Q3_K => block_size / 8 + block_size / 4 + 12 + 2,
-                GGMLType::Q4_K => 2 + 2 + 12 + block_size / 2,
-                GGMLType::Q5_K => 2 + 2 + 12 + block_size / 8 + block_size / 2,
-                GGMLType::Q6_K => block_size / 2 + block_size / 4 + block_size / 16 + 2,
-                GGMLType::Q8_K => 4 + block_size + block_size / 16 * 2,
-                GGMLType::IQ2_XXS => 2 + block_size / 8 * 2,
-                GGMLType::IQ2_XS => 2 + block_size / 8 * 2 + block_size / 32,
-                GGMLType::IQ3_XXS => 2 + 3 * (block_size / 8),
-                GGMLType::IQ1_S => 2 + block_size / 8 + block_size / 16,
-                GGMLType::IQ4_NL => 2 + 16,
-                GGMLType::IQ3_S => 2 + 13 * (block_size / 32) + block_size / 64,
-                GGMLType::IQ2_S => 2 + block_size / 4 + block_size / 16,
-                GGMLType::IQ4_XS => 2 + 2 + block_size / 64 + block_size / 2,
-                GGMLType::I8 => 1,
-                GGMLType::I16 => 2,
-                GGMLType::I32 => 4,
-                GGMLType::I64 => 8,
-                GGMLType::F64 => 8,
-                GGMLType::IQ1_M => block_size / 8 + block_size / 16 + block_size / 32,
-                GGMLType::BF16 => 2,
-                GGMLType::IQ4_NL_4_4 => 0,
-                GGMLType::IQ4_NL_4_8 => 0,
-                GGMLType::IQ4_NL_8_8 => 0,
-                GGMLType::TQ1_0 => 2 + block_size / 64 + (block_size - 4 * block_size / 64) / 5,
-                GGMLType::TQ2_0 => 2 + block_size / 4,
-                GGMLType::Q4_0_4_4 => 0,
-                GGMLType::Q4_0_4_8 => 0,
-                GGMLType::Q4_0_8_8 => 0,
-                GGMLType::MXFP4 => block_size + 1 + 16,
-                GGMLType::Count => unreachable!("GGMLType::Count is not a real data format"),
-            };
+            let (block_size, type_size) = ggml_type_layout(ggml_type_kind)?;
+            if elements % block_size != 0 {
+                return Err(anyhow!(
+                    "tensor {name:?} element count {elements} is not divisible by block size {block_size}"
+                ));
+            }
+            if offset % alignment != 0 {
+                return Err(anyhow!(
+                    "tensor {name:?} offset {offset} is not aligned to {alignment}"
+                ));
+            }
 
-            let parameters = shape[0] * shape[1] * shape[2] * shape[3];
-            let size = parameters * type_size / block_size;
+            let size = elements
+                .checked_div(block_size)
+                .and_then(|blocks| blocks.checked_mul(type_size))
+                .ok_or_else(|| anyhow!("tensor {name:?} byte size overflows u64"))?;
 
             self.tensors.push(Tensor {
                 name,
@@ -692,9 +827,75 @@ impl GGUFModel {
                 shape: shape.to_vec(),
             });
 
-            self.parameters += parameters;
+            self.parameters = self
+                .parameters
+                .checked_add(elements)
+                .ok_or_else(|| anyhow!("total parameter count overflows u64"))?;
         }
 
+        let tensor_data_start = 4u64
+            .checked_add(reader.bytes_read())
+            .ok_or_else(|| anyhow!("header length overflows u64"))?;
+        let tensor_data_start = tensor_data_start
+            .checked_add(alignment - 1)
+            .ok_or_else(|| anyhow!("aligned tensor data start overflows u64"))?
+            / alignment
+            * alignment;
+
+        self.validate_tensor_ranges(tensor_data_start, input_len)?;
+
+        Ok(())
+    }
+
+    fn alignment(&self) -> Result<u64> {
+        let raw = self
+            .kv
+            .get("general.alignment")
+            .and_then(value_as_u64)
+            .unwrap_or(GGUF_DEFAULT_ALIGNMENT);
+        if raw == 0 {
+            return Err(anyhow!("general.alignment is 0"));
+        }
+        if raw > MAX_ALIGNMENT {
+            return Err(anyhow!("general.alignment {raw} exceeds cap {MAX_ALIGNMENT}"));
+        }
+        Ok(raw)
+    }
+
+    fn validate_tensor_ranges(&self, tensor_data_start: u64, input_len: Option<u64>) -> Result<()> {
+        let mut ranges: Vec<(&str, u64, u64)> = self
+            .tensors
+            .iter()
+            .map(|t| {
+                let abs_start = tensor_data_start
+                    .checked_add(t.offset)
+                    .ok_or_else(|| anyhow!("tensor {:?} absolute offset overflows u64", t.name))?;
+                let abs_end = abs_start
+                    .checked_add(t.size)
+                    .ok_or_else(|| anyhow!("tensor {:?} byte range overflows u64", t.name))?;
+                if let Some(input_len) = input_len {
+                    if abs_end > input_len {
+                        return Err(anyhow!(
+                            "tensor {:?} extends past EOF: end={} file_size={}",
+                            t.name,
+                            abs_end,
+                            input_len
+                        ));
+                    }
+                }
+                Ok((t.name.as_str(), abs_start, abs_end))
+            })
+            .collect::<Result<_>>()?;
+        ranges.sort_by_key(|(_, start, _)| *start);
+        for w in ranges.windows(2) {
+            let (a_name, _a_start, a_end) = w[0];
+            let (b_name, b_start, _b_end) = w[1];
+            if a_end > b_start {
+                return Err(anyhow!(
+                    "tensors {a_name:?} and {b_name:?} have overlapping data ranges"
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -763,12 +964,34 @@ impl GGUFModel {
     }
 
     fn read_bool(&self, mut reader: impl std::io::Read) -> Result<bool> {
-        Ok(reader.read_u8()? != 0)
+        match reader.read_u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            other => Err(anyhow!("invalid bool value {other}; expected 0 or 1")),
+        }
     }
 
-    fn read_string(&self, mut reader: impl std::io::Read) -> Result<String> {
+    fn read_string_limited(
+        &self,
+        mut reader: impl std::io::Read,
+        max_len: u64,
+        context: &str,
+        allow_empty: bool,
+    ) -> Result<String> {
         let name_len = self.read_version_size(&mut reader)?;
-        let mut buffer = vec![0; name_len as usize];
+        if name_len == 0 && !allow_empty {
+            return Err(anyhow!("{context} has zero length"));
+        }
+        if name_len > max_len {
+            return Err(anyhow!("{context} length {name_len} exceeds cap {max_len}"));
+        }
+        let len = usize::try_from(name_len)
+            .map_err(|_| anyhow!("{context} length {name_len} does not fit in usize"))?;
+        let mut buffer = Vec::new();
+        buffer
+            .try_reserve_exact(len)
+            .map_err(|e| anyhow!("failed to reserve {context} buffer ({len} bytes): {e}"))?;
+        buffer.resize(len, 0);
         reader.read_exact(&mut buffer)?;
         Ok(String::from_utf8_lossy(&buffer).to_string())
     }
@@ -777,29 +1000,82 @@ impl GGUFModel {
         let mut data = Vec::new();
         let item_type: MetadataValueType = self.read_u32(&mut reader)?.try_into()?;
         let array_len = self.read_version_size(&mut reader)?;
-        let read_count: usize = u64::min(array_len, self.max_array_size) as usize;
-        for _ in 0..array_len {
-            let value = match item_type {
-                MetadataValueType::Uint8 => Value::from(self.read_u8(&mut reader)?),
-                MetadataValueType::Int8 => Value::from(self.read_i8(&mut reader)?),
-                MetadataValueType::Uint16 => Value::from(self.read_u16(&mut reader)?),
-                MetadataValueType::Int16 => Value::from(self.read_i16(&mut reader)?),
-                MetadataValueType::Uint32 => Value::from(self.read_u32(&mut reader)?),
-                MetadataValueType::Int32 => Value::from(self.read_i32(&mut reader)?),
-                MetadataValueType::Float32 => Value::from(self.read_f32(&mut reader)?),
-                MetadataValueType::Bool => Value::from(self.read_bool(&mut reader)?),
-                MetadataValueType::String => Value::from(self.read_string(&mut reader)?),
-                MetadataValueType::Uint64 => Value::from(self.read_u64(&mut reader)?),
-                MetadataValueType::Int64 => Value::from(self.read_i64(&mut reader)?),
-                MetadataValueType::Float64 => Value::from(self.read_f64(&mut reader)?),
-                _ => return Err(anyhow!("Unsupport item value type: Array")),
-            };
-            if read_count > 0 && data.len() < read_count {
+        if array_len > MAX_ARRAY_LEN {
+            return Err(anyhow!("array length {array_len} exceeds cap {MAX_ARRAY_LEN}"));
+        }
+        let read_count = usize::try_from(u64::min(array_len, self.max_array_size))
+            .map_err(|_| anyhow!("array storage length does not fit in usize"))?;
+        data.try_reserve_exact(read_count)
+            .map_err(|e| anyhow!("failed to reserve array buffer ({read_count} items): {e}"))?;
+        for i in 0..array_len {
+            if data.len() < read_count {
+                let value = self.read_array_value(&mut reader, &item_type)?;
                 data.push(value);
+            } else {
+                self.skip_array_value(&mut reader, &item_type)
+                    .map_err(|e| anyhow!("failed to skip array item {i}: {e}"))?;
             }
         }
 
         Ok(data)
+    }
+
+    fn read_array_value(
+        &self,
+        mut reader: impl std::io::Read,
+        item_type: &MetadataValueType,
+    ) -> Result<Value> {
+        Ok(match item_type {
+            MetadataValueType::Uint8 => Value::from(self.read_u8(&mut reader)?),
+            MetadataValueType::Int8 => Value::from(self.read_i8(&mut reader)?),
+            MetadataValueType::Uint16 => Value::from(self.read_u16(&mut reader)?),
+            MetadataValueType::Int16 => Value::from(self.read_i16(&mut reader)?),
+            MetadataValueType::Uint32 => Value::from(self.read_u32(&mut reader)?),
+            MetadataValueType::Int32 => Value::from(self.read_i32(&mut reader)?),
+            MetadataValueType::Float32 => Value::from(self.read_f32(&mut reader)?),
+            MetadataValueType::Bool => Value::from(self.read_bool(&mut reader)?),
+            MetadataValueType::String => Value::from(self.read_string_limited(
+                &mut reader,
+                MAX_STRING_VALUE_LEN,
+                "array string value",
+                true,
+            )?),
+            MetadataValueType::Uint64 => Value::from(self.read_u64(&mut reader)?),
+            MetadataValueType::Int64 => Value::from(self.read_i64(&mut reader)?),
+            MetadataValueType::Float64 => Value::from(self.read_f64(&mut reader)?),
+            MetadataValueType::Array => return Err(anyhow!("unsupported item value type: Array")),
+        })
+    }
+
+    fn skip_array_value(
+        &self,
+        mut reader: impl std::io::Read,
+        item_type: &MetadataValueType,
+    ) -> Result<()> {
+        match item_type {
+            MetadataValueType::Bool => {
+                let _ = self.read_bool(&mut reader)?;
+                Ok(())
+            }
+            MetadataValueType::Uint8 | MetadataValueType::Int8 => skip_exact(&mut reader, 1),
+            MetadataValueType::Uint16 | MetadataValueType::Int16 => skip_exact(&mut reader, 2),
+            MetadataValueType::Uint32 | MetadataValueType::Int32 | MetadataValueType::Float32 => {
+                skip_exact(&mut reader, 4)
+            }
+            MetadataValueType::Uint64 | MetadataValueType::Int64 | MetadataValueType::Float64 => {
+                skip_exact(&mut reader, 8)
+            }
+            MetadataValueType::String => {
+                let len = self.read_version_size(&mut reader)?;
+                if len > MAX_STRING_VALUE_LEN {
+                    return Err(anyhow!(
+                        "array string value length {len} exceeds cap {MAX_STRING_VALUE_LEN}"
+                    ));
+                }
+                skip_exact(&mut reader, len)
+            }
+            MetadataValueType::Array => Err(anyhow!("unsupported item value type: Array")),
+        }
     }
 
     fn read_version_size(&self, mut reader: impl std::io::Read) -> Result<u64> {
@@ -879,7 +1155,9 @@ impl GGUFModel {
     /// Returns "unknown" if not present.
     pub fn file_type(&self) -> String {
         if let Some(ft) = self.kv.get("general.file_type") {
-            file_type(ft.as_u64().unwrap())
+            ft.as_u64()
+                .map(file_type)
+                .unwrap_or_else(|| "unknown".into())
         } else {
             String::from("unknown")
         }
@@ -961,6 +1239,7 @@ pub fn get_gguf_container_array_size(file: &str, max_array_size: u64) -> Result<
         return Err(anyhow!("file not found"));
     }
     let mut reader = std::fs::File::open(file)?;
+    let input_len = reader.metadata()?.len();
     let byte_le = reader.read_i32::<LittleEndian>()?;
     match byte_le {
         FILE_MAGIC_GGML => Err(anyhow!("unsupport ggml format")),
@@ -968,10 +1247,12 @@ pub fn get_gguf_container_array_size(file: &str, max_array_size: u64) -> Result<
         FILE_MAGIC_GGJT => Err(anyhow!("unsupport ggjt format")),
         FILE_MAGIC_GGLA => Err(anyhow!("unsupport ggla format")),
         FILE_MAGIC_GGUF_LE => {
-            Ok(GGUFContainer::new(ByteOrder::LE, Box::new(reader), max_array_size))
+            Ok(GGUFContainer::new(ByteOrder::LE, Box::new(reader), max_array_size)
+                .with_input_len(input_len))
         }
         FILE_MAGIC_GGUF_BE => {
-            Ok(GGUFContainer::new(ByteOrder::BE, Box::new(reader), max_array_size))
+            Ok(GGUFContainer::new(ByteOrder::BE, Box::new(reader), max_array_size)
+                .with_input_len(input_len))
         }
         _ => Err(anyhow!("invalid file magic")),
     }
@@ -980,6 +1261,94 @@ pub fn get_gguf_container_array_size(file: &str, max_array_size: u64) -> Result<
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+
+    fn push_string(out: &mut Vec<u8>, s: &str) {
+        out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        out.extend_from_slice(s.as_bytes());
+    }
+
+    fn decode_bytes(bytes: Vec<u8>) -> anyhow::Result<super::GGUFModel> {
+        use std::io::Cursor;
+        let len = bytes.len() as u64;
+        let cursor = Cursor::new(bytes);
+        let mut container = super::GGUFContainer::new(super::ByteOrder::LE, Box::new(cursor), 3)
+            .with_input_len(len);
+        container.decode()
+    }
+
+    fn empty_v3(num_tensors: u64, num_kv: u64) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&super::GGUF_VERSION_V3.to_le_bytes());
+        b.extend_from_slice(&num_tensors.to_le_bytes());
+        b.extend_from_slice(&num_kv.to_le_bytes());
+        b
+    }
+
+    fn one_tensor_v3(name: &str, dims: &[u64], kind: u32, offset: u64) -> Vec<u8> {
+        let mut b = empty_v3(1, 0);
+        push_string(&mut b, name);
+        b.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+        for &dim in dims {
+            b.extend_from_slice(&dim.to_le_bytes());
+        }
+        b.extend_from_slice(&kind.to_le_bytes());
+        b.extend_from_slice(&offset.to_le_bytes());
+        b
+    }
+
+    fn one_kv_v3(key: &str, value_type: u32, value_bytes: &[u8]) -> Vec<u8> {
+        let mut b = empty_v3(0, 1);
+        push_string(&mut b, key);
+        b.extend_from_slice(&value_type.to_le_bytes());
+        b.extend_from_slice(value_bytes);
+        b
+    }
+
+    enum TestKv<'a> {
+        U64(&'a str, u64),
+        StrLen(&'a str, u64),
+        Bool(&'a str, u8),
+    }
+
+    struct TestTensor<'a> {
+        name: &'a str,
+        dims: &'a [u64],
+        kind: u32,
+        offset: u64,
+    }
+
+    fn build_v3(kvs: &[TestKv<'_>], tensors: &[TestTensor<'_>]) -> Vec<u8> {
+        let mut b = empty_v3(tensors.len() as u64, kvs.len() as u64);
+        for kv in kvs {
+            match kv {
+                TestKv::U64(key, value) => {
+                    push_string(&mut b, key);
+                    b.extend_from_slice(&10u32.to_le_bytes());
+                    b.extend_from_slice(&value.to_le_bytes());
+                }
+                TestKv::StrLen(key, len) => {
+                    push_string(&mut b, key);
+                    b.extend_from_slice(&8u32.to_le_bytes());
+                    b.extend_from_slice(&len.to_le_bytes());
+                }
+                TestKv::Bool(key, value) => {
+                    push_string(&mut b, key);
+                    b.extend_from_slice(&7u32.to_le_bytes());
+                    b.push(*value);
+                }
+            }
+        }
+        for tensor in tensors {
+            push_string(&mut b, tensor.name);
+            b.extend_from_slice(&(tensor.dims.len() as u32).to_le_bytes());
+            for &dim in tensor.dims {
+                b.extend_from_slice(&dim.to_le_bytes());
+            }
+            b.extend_from_slice(&tensor.kind.to_le_bytes());
+            b.extend_from_slice(&tensor.offset.to_le_bytes());
+        }
+        b
+    }
 
     #[test]
     fn test_read_le_v3_gguf() {
@@ -1173,6 +1542,12 @@ mod tests {
     }
 
     #[test]
+    fn test_mxfp4_layout_matches_current_ggml() {
+        let (block_size, type_size) = super::ggml_type_layout(super::GGMLType::MXFP4).unwrap();
+        assert_eq!((block_size, type_size), (32, 17));
+    }
+
+    #[test]
     fn test_ggml_type_invalid() {
         use super::GGMLType;
         use std::convert::TryFrom;
@@ -1315,6 +1690,141 @@ mod tests {
                 assert!(arr.len() <= 1, "Array should be truncated to max size");
             }
         }
+    }
+
+    #[test]
+    fn rejects_tensor_count_over_cap() {
+        assert!(decode_bytes(empty_v3(super::MAX_TENSORS + 1, 0)).is_err());
+    }
+
+    #[test]
+    fn rejects_kv_count_over_cap() {
+        assert!(decode_bytes(empty_v3(0, super::MAX_KV + 1)).is_err());
+    }
+
+    #[test]
+    fn rejects_dims_zero_or_too_large() {
+        assert!(decode_bytes(one_tensor_v3("t", &[], 0, 0)).is_err());
+        assert!(decode_bytes(one_tensor_v3("t", &[1, 1, 1, 1, 1], 0, 0)).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_kind_count() {
+        assert!(decode_bytes(one_tensor_v3("t", &[1], 40, 0)).is_err());
+    }
+
+    #[test]
+    fn rejects_bad_quant_block_alignment() {
+        assert!(decode_bytes(one_tensor_v3("t", &[1], 12, 0)).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_bool_value() {
+        let bytes = build_v3(&[TestKv::Bool("bad.bool", 2)], &[]);
+        assert!(decode_bytes(bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_metadata_key() {
+        let long_key = "k".repeat((super::MAX_METADATA_KEY_LEN + 1) as usize);
+        let bytes = one_kv_v3(&long_key, 10, &1u64.to_le_bytes());
+        assert!(decode_bytes(bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_tensor_name() {
+        let long_name = "t".repeat((super::MAX_TENSOR_NAME_LEN + 1) as usize);
+        let bytes = one_tensor_v3(&long_name, &[1], 0, 0);
+        assert!(decode_bytes(bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_metadata_string_length_without_allocating() {
+        let bytes = build_v3(
+            &[TestKv::StrLen(
+                "big.string",
+                super::MAX_STRING_VALUE_LEN + 1,
+            )],
+            &[],
+        );
+        assert!(decode_bytes(bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_array_length() {
+        let mut bytes = empty_v3(0, 1);
+        push_string(&mut bytes, "big.array");
+        bytes.extend_from_slice(&9u32.to_le_bytes());
+        bytes.extend_from_slice(&10u32.to_le_bytes());
+        bytes.extend_from_slice(&(super::MAX_ARRAY_LEN + 1).to_le_bytes());
+        assert!(decode_bytes(bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_unaligned_tensor_offset() {
+        let bytes = build_v3(
+            &[TestKv::U64("general.alignment", 64)],
+            &[TestTensor {
+                name: "t",
+                dims: &[1],
+                kind: 0,
+                offset: 1,
+            }],
+        );
+        assert!(decode_bytes(bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_overlapping_tensor_ranges() {
+        let bytes = build_v3(
+            &[],
+            &[
+                TestTensor {
+                    name: "a",
+                    dims: &[1],
+                    kind: 0,
+                    offset: 0,
+                },
+                TestTensor {
+                    name: "b",
+                    dims: &[1],
+                    kind: 0,
+                    offset: 0,
+                },
+            ],
+        );
+        assert!(decode_bytes(bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_tensor_range_past_eof_when_length_known() {
+        let bytes = one_tensor_v3("t", &[1], 0, 0);
+        assert!(decode_bytes(bytes).is_err());
+    }
+
+    #[test]
+    fn validates_skipped_bool_array_entries() {
+        use std::io::Cursor;
+        let mut bytes = empty_v3(0, 1);
+        push_string(&mut bytes, "bool.array");
+        bytes.extend_from_slice(&9u32.to_le_bytes());
+        bytes.extend_from_slice(&7u32.to_le_bytes());
+        bytes.extend_from_slice(&2u64.to_le_bytes());
+        bytes.push(1);
+        bytes.push(2);
+
+        let len = bytes.len() as u64;
+        let cursor = Cursor::new(bytes);
+        let mut container = super::GGUFContainer::new(super::ByteOrder::LE, Box::new(cursor), 1)
+            .with_input_len(len);
+        assert!(container.decode().is_err());
+    }
+
+    #[test]
+    fn malformed_file_type_does_not_panic() {
+        let bytes = build_v3(&[TestKv::StrLen("general.file_type", 0)], &[]);
+        let model = decode_bytes(bytes).unwrap();
+        assert_eq!(model.file_type(), "unknown");
     }
 }
 

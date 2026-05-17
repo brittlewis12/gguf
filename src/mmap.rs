@@ -10,7 +10,7 @@
 //! use gguf_rs::mmap::MmapGGUF;
 //!
 //! let mmap = MmapGGUF::open("model.gguf")?;
-//! let model = mmap.decode()?;
+//! let model = mmap.model();
 //!
 //! println!("Architecture: {}", model.model_family());
 //! println!("Tensors: {}", model.num_tensor());
@@ -24,9 +24,11 @@
 //! - OS-managed memory paging
 
 use anyhow::{anyhow, Result};
-use memmap2::Mmap;
+use memmap2::{Mmap, MmapOptions};
 use std::fs::File;
+use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::{ByteOrder, GGUFModel, FILE_MAGIC_GGUF_BE, FILE_MAGIC_GGUF_LE};
 
@@ -36,8 +38,25 @@ use crate::{ByteOrder, GGUFModel, FILE_MAGIC_GGUF_BE, FILE_MAGIC_GGUF_LE};
 /// The file is not loaded into memory until specific regions are accessed.
 pub struct MmapGGUF {
     #[allow(dead_code)]
-    mmap: Mmap,
+    mmap: Arc<Mmap>,
     model: GGUFModel,
+}
+
+struct MmapReader {
+    mmap: Arc<Mmap>,
+    pos: usize,
+}
+
+impl Read for MmapReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.mmap.len() {
+            return Ok(0);
+        }
+        let n = buf.len().min(self.mmap.len() - self.pos);
+        buf[..n].copy_from_slice(&self.mmap[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
 }
 
 impl MmapGGUF {
@@ -63,6 +82,10 @@ impl MmapGGUF {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::open_with_array_size(path, 3)
+    }
+
+    pub fn open_with_array_size<P: AsRef<Path>>(path: P, max_array_size: u64) -> Result<Self> {
         let path = path.as_ref();
 
         if !path.exists() {
@@ -70,7 +93,7 @@ impl MmapGGUF {
         }
 
         let file = File::open(path)?;
-        let mmap = unsafe { Mmap::map(&file)? };
+        let mmap = Arc::new(unsafe { MmapOptions::new().map_copy_read_only(&file)? });
 
         // Check magic number to determine byte order
         if mmap.len() < 4 {
@@ -85,13 +108,12 @@ impl MmapGGUF {
             _ => return Err(anyhow!("invalid file magic: not a GGUF file")),
         };
 
-        // Parse the file by copying data (required due to lifetime constraints)
-        // For true zero-copy, a more complex design would be needed
-        let data = mmap[4..].to_vec();
-        let cursor = std::io::Cursor::new(data);
-
-        // Create container and decode
-        let mut container = crate::GGUFContainer::new(byte_order, Box::new(cursor), u64::MAX);
+        let reader = MmapReader {
+            mmap: Arc::clone(&mmap),
+            pos: 4,
+        };
+        let mut container = crate::GGUFContainer::new(byte_order, Box::new(reader), max_array_size)
+            .with_input_len(mmap.len() as u64);
         let model = container.decode()?;
 
         Ok(Self { mmap, model })
@@ -104,7 +126,7 @@ impl MmapGGUF {
 
     /// Get a reference to the raw memory-mapped data
     pub fn as_slice(&self) -> &[u8] {
-        &self.mmap
+        self.mmap.as_ref()
     }
 
     /// Get the size of the memory-mapped file
