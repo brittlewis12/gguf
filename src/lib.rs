@@ -236,6 +236,7 @@ pub struct GGUFContainer {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 enum InputBounds {
     Unknown,
     Known(u64),
@@ -291,6 +292,7 @@ impl GGUFContainer {
     ///
     /// This disables EOF-based tensor range validation and is kept crate-local
     /// so external users cannot accidentally bypass checked parsing.
+    #[allow(dead_code)]
     pub(crate) fn allow_unbounded_input(mut self) -> Self {
         self.input_bounds = InputBounds::TrustedUnbounded;
         self
