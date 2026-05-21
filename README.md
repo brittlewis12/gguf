@@ -2,11 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/gguf-rs.svg)](https://crates.io/crates/gguf-rs)
 [![Documentation](https://docs.rs/gguf-rs/badge.svg)](https://docs.rs/gguf-rs)
-[![License](https://img.shields.io/crates/l/gguf-rs.svg)](https://github.com/zackshen/gguf/blob/main/LICENSE)
-![Unit test](https://github.com/zackshen/gguf/actions/workflows/test.yml/badge.svg)
-![Security Audit](https://github.com/zackshen/gguf/actions/workflows/audit.yml/badge.svg)
-![Publish](https://github.com/zackshen/gguf/actions/workflows/publish.yml/badge.svg)
-[![codecov](https://codecov.io/gh/zackshen/gguf/graph/badge.svg?token=REPLACE_WITH_TOKEN)](https://codecov.io/gh/zackshen/gguf)
+[![License](https://img.shields.io/crates/l/gguf-rs.svg)](https://github.com/brittlewis12/gguf/blob/main/LICENSE)
 
 A Rust library for parsing and reading GGUF (GGML Universal Format) files. GGUF files are binary files that contain key-value metadata and tensors, commonly used for storing quantized machine learning models.
 
@@ -18,7 +14,7 @@ A Rust library for parsing and reading GGUF (GGML Universal Format) files. GGUF 
 - ✅ Support for little-endian and big-endian files
 - ✅ CLI tool for quick inspection
 - ✅ Zero-copy metadata access
-- ✅ Memory-mapped file support (optional `mmap` feature)
+- ✅ In-memory snapshot reader (optional `mmap` feature)
 - ✅ Async I/O support (optional `async` feature)
 - ✅ Write GGUF files
 
@@ -28,7 +24,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-gguf-rs = "0.1"
+gguf-rs = "0.2"
 ```
 
 Or install the CLI tool:
@@ -168,33 +164,38 @@ The library has minimal memory overhead:
 - Metadata storage: O(n_kv + n_tensors) where n_kv = number of key-value pairs, n_tensors = number of tensors
 - No tensor data is loaded into memory unless explicitly requested
 
-### Memory-Mapped Files
+### In-memory snapshot via `MmapGGUF`
 
-For large GGUF files (multiple GB), use the `mmap` feature for efficient access:
+The `mmap` feature exposes `MmapGGUF`, which reads the entire file into
+an anonymous memory-mapped buffer at `open()` time and parses from that
+frozen copy. Despite the name, this is **not** a lazy live file mapping
+— the full file is materialized up front, capped by
+`DEFAULT_MAX_HELPER_INPUT_BYTES` (256 MiB by default; configurable via
+`MmapGGUF::open_with_limits`).
+
+Use it when you want snapshot semantics (e.g., parsing files that may
+be mutated concurrently). For header-only parsing of large model files
+prefer the streaming helpers (`get_gguf_container`,
+`get_gguf_container_array_size`), which never materialize the file.
 
 ```toml
 [dependencies]
-gguf-rs = { version = "0.1", features = ["mmap"] }
+gguf-rs = { version = "0.2", features = ["mmap"] }
 ```
 
 ```rust,no_run
 use gguf_rs::mmap::MmapGGUF;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mmap = MmapGGUF::open("large_model.gguf")?;
-    let model = mmap.decode()?;
-    
+    let mmap = MmapGGUF::open("model.gguf")?;
+    let model = mmap.model();
+
     println!("Architecture: {}", model.model_family());
     println!("Tensors: {}", model.num_tensor());
-    
+
     Ok(())
 }
 ```
-
-Benefits of memory mapping:
-- **Lazy loading**: Only accessed pages are loaded into memory
-- **OS-managed paging**: The operating system handles memory management
-- **Fast random access**: Direct pointer access to file data
 
 ### Async I/O
 
@@ -202,7 +203,7 @@ For async applications, enable the `async` feature:
 
 ```toml
 [dependencies]
-gguf-rs = { version = "0.1", features = ["async"] }
+gguf-rs = { version = "0.2", features = ["async"] }
 ```
 
 ```rust,no_run
@@ -296,7 +297,7 @@ Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for gui
 
 ## Security
 
-Please report security vulnerabilities to zackshen0526@gmail.com. See [SECURITY.md](SECURITY.md) for more information.
+See [SECURITY.md](SECURITY.md) for reporting.
 
 ## GGUF Specification
 

@@ -2,53 +2,27 @@
 
 ## Supported Versions
 
-Currently, all versions of `gguf-rs` are supported for security updates.
+The most recent published `0.2.x` release receives security updates.
+Older releases are best-effort.
 
 ## Reporting a Vulnerability
 
-If you discover a security vulnerability, please report it privately to us before disclosing it publicly.
+Preferred: open a private security advisory at
+<https://github.com/brittlewis12/gguf/security/advisories/new>.
 
-### How to Report
+Fallback: email `brittlewis12@gmail.com` with a subject line starting with
+`[SECURITY]`.
 
-- Send an email to: zackshen0526@gmail.com
-- Use a descriptive subject line starting with `[SECURITY]`
+### What to include
 
-### What to Include
-
-Please include as much information as possible:
-
-- Type of vulnerability
-- Steps to reproduce
-- Potential impact
-- Suggested fix (if known)
+- Affected version(s) and a minimal reproducer (a malformed GGUF file is
+  the most useful artifact).
+- Observed behavior (panic, OOM, infinite loop, OOB read, etc.).
+- Your assessment of impact and any suggested fix.
 
 ### Response
 
-We will:
-
-- Acknowledge receipt within 48 hours
-- Provide a detailed response within 7 days
-- Confirm the vulnerability and assess impact
-- Work on a fix and coordinate disclosure
-- Credit you in the security advisory
-
-### Disclosure Policy
-
-We aim to fix vulnerabilities within 14 days of confirmation. Once fixed, we will:
-
-- Release a new version with the fix
-- Publish a security advisory
-- Credit the reporter (if desired)
-
-## Security Best Practices
-
-This library parses GGUF files, which are binary files. Always:
-
-- Validate input files before parsing
-- Be cautious with files from untrusted sources
-- Consider resource limits when processing large files
-- Use in a sandboxed environment if processing user-provided files
-
-## Dependencies
-
-We strive to keep dependencies up-to-date and secure. If you discover a security issue in a dependency, please report it following the same process.
+- Acknowledgement within 48 hours.
+- Initial assessment within 7 days.
+- Coordinated disclosure once a fix is ready. Reporters are credited in
+  the advisory unless they request otherwise.

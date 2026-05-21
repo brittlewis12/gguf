@@ -1,14 +1,25 @@
 [package]
 name = "gguf-rs"
-version = "0.1.7"
+version = "0.2.0"
 description = "GGUF file parser"
 edition = "2021"
 license = "MIT"
-authors = ["Zack Shen <zackshen0526@gmail.com>"]
+authors = [
+    "Zack Shen <zackshen0526@gmail.com>",
+    "Britt Lewis <brittlewis12@gmail.com>",
+]
 keywords = ["gguf", "parser", "GPT", "llama", "llm"]
-repository = "https://github.com/zackshen/gguf"
-homepage = "https://github.com/zackshen/gguf"
-include = ["src/**/*", "README.md"]
+repository = "https://github.com/brittlewis12/gguf"
+homepage = "https://github.com/brittlewis12/gguf"
+include = [
+    "src/**/*",
+    "benches/**/*",
+    "tests/**/*",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "SECURITY.md",
+]
 categories = ["parser-implementations", "science"]
 
 [dependencies]

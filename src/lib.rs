@@ -12,7 +12,7 @@
 //! - Access tensor information
 //! - Support for little-endian and big-endian files
 //! - CLI tool for quick inspection
-//! - Optional memory-mapped file support (enable `mmap` feature)
+//! - Optional in-memory snapshot support via the `mmap` feature
 //!
 //! ## Example
 //!
@@ -57,19 +57,24 @@
 //! gguf model.gguf --tensors
 //! ```
 //!
-//! ## Memory-Mapped Files
+//! ## In-memory snapshot via `MmapGGUF`
 //!
-//! For large files, enable the `mmap` feature for more efficient access:
+//! Enable the `mmap` feature for an in-memory snapshot reader. Despite the
+//! name, this materializes the entire file into an anonymous memory-mapped
+//! buffer at `open()` time and parses from that frozen copy; it is not a
+//! lazy live mapping. Use it when you specifically want snapshot semantics
+//! (e.g., for files that may be mutated concurrently). For header-only
+//! parsing of large files, prefer the streaming helpers above.
 //!
 //! ```toml
 //! [dependencies]
-//! gguf-rs = { version = "0.1", features = ["mmap"] }
+//! gguf-rs = { version = "0.2", features = ["mmap"] }
 //! ```
 //!
 //! ```rust,ignore
 //! use gguf_rs::mmap::MmapGGUF;
 //!
-//! let mmap = MmapGGUF::open("large_model.gguf")?;
+//! let mmap = MmapGGUF::open("model.gguf")?;
 //! let model = mmap.model();
 //! println!("{}", model.model_family());
 //! # Ok::<(), Box<dyn std::error::Error>>(())
@@ -81,7 +86,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! gguf-rs = { version = "0.1", features = ["async"] }
+//! gguf-rs = { version = "0.2", features = ["async"] }
 //! ```
 //!
 //! ```rust,ignore
@@ -96,6 +101,58 @@
 //!     Ok(())
 //! }
 //! ```
+//!
+//! ## Parsing untrusted files
+//!
+//! The parser defends against adversarial structure (malformed headers,
+//! oversized tensor counts, dimension overflow, etc.) via internal caps
+//! and tensor-range EOF validation. It does **not** defend against
+//! adversarial file *size*; total file size is application policy and is
+//! the caller's responsibility (validator harness, `RLIMIT_AS`, upload
+//! limit, etc.).
+//!
+//! Enforced parser caps:
+//!
+//! | Constant                 | Default       | Bounds                                                       |
+//! |--------------------------|---------------|--------------------------------------------------------------|
+//! | `MAX_HEADER_BYTES`       | 128 MiB       | Total bytes the parser will read before tensor data begins.  |
+//! | `MAX_METADATA_BYTES`     | 64 MiB        | Total bytes consumed by KV metadata values.                  |
+//! | `MAX_TENSORS`            | 100,000       | Number of tensor descriptors declared in the header.         |
+//! | `MAX_KV`                 | 100,000       | Number of KV pairs declared in the header.                   |
+//! | `MAX_METADATA_KEY_LEN`   | 65,535        | Length of any single metadata key.                           |
+//! | `MAX_TENSOR_NAME_LEN`    | 64            | Length of any single tensor name.                            |
+//! | `MAX_STRING_VALUE_LEN`   | 16 MiB        | Length of any single metadata string value.                  |
+//! | `MAX_ARRAY_LEN`          | 1,000,000     | Declared length of any metadata array.                       |
+//! | `MAX_STORED_ARRAY_ITEMS` | 300,000       | Number of array items retained in memory.                    |
+//! | `MAX_DIMENSION`          | 2^30          | Any single tensor dimension.                                 |
+//! | `MAX_ELEMENTS`           | 2^40          | Total element count of any tensor.                           |
+//! | `MAX_ALIGNMENT`          | 65,536        | Declared tensor-data alignment.                              |
+//!
+//! Tensor byte ranges are additionally validated against the input length
+//! (no overflow, no past-EOF, no overlap, alignment respected) whenever a
+//! path-based helper or `with_input_len` is used. The async helpers
+//! re-stat the descriptor at decode time; the sync helpers and
+//! `MmapGGUF` use the length sampled when they opened or snapshotted
+//! the file. For frozen-bytes semantics use `MmapGGUF::open_with_limits`.
+//!
+//! API surface and trust posture:
+//!
+//! | Surface                                                   | Materializes file?   | Applies size cap?  | TOCTOU defense?            |
+//! |-----------------------------------------------------------|----------------------|--------------------|----------------------------|
+//! | [`get_gguf_container`]                                    | No                   | No                 | No                         |
+//! | [`get_gguf_container_array_size`]                         | No                   | No                 | No                         |
+//! | [`get_gguf_container_array_size_with_limit`] *(deprecated)* | Yes                | Yes (caller-set)   | Partial (frozen `Vec<u8>`) |
+//! | `AsyncGGUF::open` / `read_gguf*`                          | No                   | No                 | No                         |
+//! | `AsyncGGUF::open_with_limits` *(deprecated)*              | Yes                  | Yes (caller-set)   | Partial (frozen `Vec<u8>`) |
+//! | `MmapGGUF::open_with_limits` *(`mmap` feature)*           | Yes (anonymous mmap) | Yes (caller-set)   | Post-snapshot only         |
+//! | [`GGUFContainer::new`] + [`GGUFContainer::with_input_len`] | Caller's choice     | No                 | Caller's choice            |
+//!
+//! "Partial" means the parser sees a frozen `Vec<u8>`, but downstream
+//! code still uses the parsed tensor offsets against the live file
+//! unless the caller arranges otherwise. "Post-snapshot only" means
+//! `MmapGGUF` freezes bytes after `read_exact` returns; the read
+//! itself is not atomic against in-place mutation. For stronger
+//! guarantees, hash-verify the file before parsing.
 
 use anyhow::{anyhow, Result};
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
@@ -103,7 +160,12 @@ use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
 use log::debug;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{borrow::Borrow, collections::BTreeMap, fmt::Display, io::Read};
+use std::{
+    borrow::Borrow,
+    collections::BTreeMap,
+    fmt::Display,
+    io::{Read, Seek, SeekFrom},
+};
 
 /// Magic constant for `ggml` files (unversioned).
 pub const FILE_MAGIC_GGML: i32 = 0x67676d6c;
@@ -125,6 +187,8 @@ const THOUSAND: u64 = 1000;
 const MILLION: u64 = 1_000_000;
 const BILLION: u64 = 1_000_000_000;
 
+// Parser caps. See the "Parsing untrusted files" section of the crate docs
+// for the parser-safety vs. application-policy distinction.
 const GGUF_DEFAULT_ALIGNMENT: u64 = 32;
 const MAX_ALIGNMENT: u64 = 65536;
 const MAX_TENSORS: u64 = 100_000;
@@ -138,7 +202,10 @@ const MAX_DIMENSION: u64 = 1u64 << 30;
 const MAX_ELEMENTS: u64 = 1u64 << 40;
 const MAX_METADATA_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_HEADER_BYTES: u64 = 128 * 1024 * 1024;
-const DEFAULT_MAX_HELPER_INPUT_BYTES: u64 = 256 * 1024 * 1024;
+/// Default cap on the in-memory snapshot taken by snapshot helpers
+/// (`get_gguf_container_array_size_with_limit`, `MmapGGUF`). Streaming
+/// helpers do not apply this cap.
+pub const DEFAULT_MAX_HELPER_INPUT_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Convert a number to a human-readable string.
 fn human_number(value: u64) -> String {
@@ -150,35 +217,50 @@ fn human_number(value: u64) -> String {
     }
 }
 
-/// Convert a file type to a human-readable string.
-/// GGUF spec: https://github.com/ggerganov/ggml/blob/master/docs/gguf.md
+/// Convert a `general.file_type` value (llama.cpp's `llama_ftype`) to a
+/// human-readable string. The `GUESSED` flag is reported as a suffix.
+const FTYPE_GUESSED: u64 = 1024;
+
 fn file_type(ft: u64) -> String {
+    if ft & FTYPE_GUESSED != 0 {
+        return format!("{} (guessed)", file_type(ft & !FTYPE_GUESSED));
+    }
     match ft {
         0 => "All F32",
         1 => "Mostly F16",
         2 => "Mostly Q4_0",
         3 => "Mostly Q4_1",
-        4 => "Mostly Q4_1 Some F16",
-        5 => "Mostly Q4_2 (UNSUPPORTED)",
-        6 => "Mostly Q4_3 (UNSUPPORTED)",
         7 => "Mostly Q8_0",
         8 => "Mostly Q5_0",
         9 => "Mostly Q5_1",
         10 => "Mostly Q2_K",
-        11 => "Mostly Q3_K",
-        12 => "Mostly Q4_K",
-        13 => "Mostly Q5_K",
-        14 => "Mostly Q6_K",
-        15 => "Mostly IQ2_XXS",
-        16 => "Mostly IQ2_XS",
-        17 => "Mostly IQ3_XXS",
-        18 => "Mostly IQ1_S",
-        19 => "Mostly IQ4_NL",
-        20 => "Mostly IQ3_S",
-        21 => "Mostly IQ2_S",
-        22 => "Mostly IQ4_XS",
-        23 => "Mostly IQ1_M",
-        24 => "Mostly BF16",
+        11 => "Mostly Q3_K_S",
+        12 => "Mostly Q3_K_M",
+        13 => "Mostly Q3_K_L",
+        14 => "Mostly Q4_K_S",
+        15 => "Mostly Q4_K_M",
+        16 => "Mostly Q5_K_S",
+        17 => "Mostly Q5_K_M",
+        18 => "Mostly Q6_K",
+        19 => "Mostly IQ2_XXS",
+        20 => "Mostly IQ2_XS",
+        21 => "Mostly Q2_K_S",
+        22 => "Mostly IQ3_XS",
+        23 => "Mostly IQ3_XXS",
+        24 => "Mostly IQ1_S",
+        25 => "Mostly IQ4_NL",
+        26 => "Mostly IQ3_S",
+        27 => "Mostly IQ3_M",
+        28 => "Mostly IQ2_S",
+        29 => "Mostly IQ2_M",
+        30 => "Mostly IQ4_XS",
+        31 => "Mostly IQ1_M",
+        32 => "Mostly BF16",
+        36 => "Mostly TQ1_0",
+        37 => "Mostly TQ2_0",
+        38 => "Mostly MXFP4_MOE",
+        39 => "Mostly NVFP4",
+        40 => "Mostly Q1_0",
         _ => "unknown",
     }
     .to_string()
@@ -273,7 +355,11 @@ impl GGUFContainer {
         Ok(Self::new_after_magic(bo, reader, max_array_size))
     }
 
-    fn new_after_magic(bo: ByteOrder, reader: Box<dyn std::io::Read>, max_array_size: u64) -> Self {
+    pub(crate) fn new_after_magic(
+        bo: ByteOrder,
+        reader: Box<dyn std::io::Read>,
+        max_array_size: u64,
+    ) -> Self {
         Self {
             bo,
             version: Version::V1(V1::default()),
@@ -642,7 +728,9 @@ pub enum GGMLType {
     IQ4_NL_4_8 = 37, // Unsupported
     IQ4_NL_8_8 = 38, // Unsupported
     MXFP4 = 39,
-    Count = 40,
+    NVFP4 = 40,
+    Q1_0 = 41,
+    Count = 42,
 }
 
 impl Display for GGMLType {
@@ -688,6 +776,8 @@ impl Display for GGMLType {
             GGMLType::IQ4_NL_4_8 => write!(f, "IQ4_NL_4_8 (UNSUPPORTED)"),
             GGMLType::IQ4_NL_8_8 => write!(f, "IQ4_NL_8_8 (UNSUPPORTED)"),
             GGMLType::MXFP4 => write!(f, "MXFP4"),
+            GGMLType::NVFP4 => write!(f, "NVFP4"),
+            GGMLType::Q1_0 => write!(f, "Q1_0"),
             GGMLType::Count => write!(f, "Count"),
         }
     }
@@ -736,6 +826,8 @@ impl TryFrom<u32> for GGMLType {
             37 => GGMLType::IQ4_NL_4_8,
             38 => GGMLType::IQ4_NL_8_8,
             39 => GGMLType::MXFP4,
+            40 => GGMLType::NVFP4,
+            41 => GGMLType::Q1_0,
             _ => return Err(anyhow!("invalid GGML type")),
         })
     }
@@ -806,6 +898,8 @@ fn ggml_type_layout(kind: GGMLType) -> Result<(u64, u64)> {
         GGMLType::TQ1_0 => (K, 2 + K / 64 + (K - 4 * (K / 64)) / 5),
         GGMLType::TQ2_0 => (K, 2 + K / 4),
         GGMLType::MXFP4 => (32, 17),
+        GGMLType::NVFP4 => (64, 36),
+        GGMLType::Q1_0 => (128, 18),
         GGMLType::Count => (0, 0),
     };
     if block_size == 0 || type_size == 0 {
@@ -1380,7 +1474,16 @@ impl GGUFModel {
     }
 }
 
-/// Get a `GGUFContainer` from a file, truncating all arrays to length 3.
+/// Open a GGUF file and return a `GGUFContainer` that streams from the file,
+/// truncating all metadata arrays to length 3.
+///
+/// The file is read incrementally through a `std::fs::File` handle; only the
+/// header bytes consumed by `decode()` are read from disk. Parser caps
+/// (`MAX_HEADER_BYTES`, `MAX_METADATA_BYTES`, `MAX_TENSORS`, etc.) and
+/// tensor EOF/range validation against the file's length still apply.
+///
+/// For a frozen in-memory snapshot, use `MmapGGUF::open_with_limits`
+/// (requires the `mmap` feature) and pick an explicit cap.
 ///
 /// # Errors
 ///
@@ -1399,10 +1502,13 @@ impl GGUFModel {
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub fn get_gguf_container(file: &str) -> Result<GGUFContainer> {
-    get_gguf_container_array_size_with_limit(file, 3, DEFAULT_MAX_HELPER_INPUT_BYTES)
+    open_streaming(file, 3)
 }
 
-/// Get a `GGUFContainer` from a file with the provided max array size.
+/// Open a GGUF file and return a `GGUFContainer` that streams from the file,
+/// with the provided max array size for metadata arrays.
+///
+/// See [`get_gguf_container`] for the streaming semantics.
 ///
 /// # Arguments
 ///
@@ -1430,14 +1536,50 @@ pub fn get_gguf_container(file: &str) -> Result<GGUFContainer> {
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub fn get_gguf_container_array_size(file: &str, max_array_size: u64) -> Result<GGUFContainer> {
-    get_gguf_container_array_size_with_limit(file, max_array_size, DEFAULT_MAX_HELPER_INPUT_BYTES)
+    open_streaming(file, max_array_size)
 }
 
+/// Open a GGUF file by snapshotting its entire contents into memory, with an
+/// explicit byte cap on that snapshot.
+///
+/// # Errors
+///
+/// In addition to the errors documented on [`get_gguf_container`], returns
+/// `"file size {N} exceeds helper input cap {M} bytes"` when the file is
+/// larger than `max_input_bytes`, and
+/// `"failed to reserve helper snapshot ({N} bytes): {…}"` when the host
+/// cannot allocate the snapshot buffer.
+#[deprecated(
+    since = "0.2.0",
+    note = "snapshots the entire file into memory; use get_gguf_container / \
+            get_gguf_container_array_size for streaming header parsing, or \
+            MmapGGUF::open_with_limits for frozen snapshot semantics"
+)]
 pub fn get_gguf_container_array_size_with_limit(
     file: &str,
     max_array_size: u64,
     max_input_bytes: u64,
 ) -> Result<GGUFContainer> {
+    open_snapshot(file, max_array_size, max_input_bytes)
+}
+
+fn open_streaming(file: &str, max_array_size: u64) -> Result<GGUFContainer> {
+    let handle = match std::fs::File::open(file) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(anyhow!("file not found"));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let input_len = handle.metadata()?.len();
+    // Buffer the file handle so the parser's many small reads
+    // (i32 / u32 / u64 / per-byte string lengths) don't translate
+    // into one syscall each.
+    let reader = std::io::BufReader::new(handle);
+    Ok(GGUFContainer::new(Box::new(reader), max_array_size)?.with_input_len(input_len))
+}
+
+fn open_snapshot(file: &str, max_array_size: u64, max_input_bytes: u64) -> Result<GGUFContainer> {
     if !std::path::Path::new(file).exists() {
         return Err(anyhow!("file not found"));
     }
@@ -1453,8 +1595,7 @@ pub fn get_gguf_container_array_size_with_limit(
     let mut magic = [0u8; 4];
     reader.read_exact(&mut magic)?;
     detect_magic(magic)?;
-    use std::io::Seek;
-    reader.seek(std::io::SeekFrom::Start(0))?;
+    reader.seek(SeekFrom::Start(0))?;
     let len = usize::try_from(input_len)
         .map_err(|_| anyhow!("file too large to snapshot into memory on this platform"))?;
     let mut bytes = Vec::new();
@@ -1712,10 +1853,18 @@ mod tests {
         assert_eq!(super::file_type(0), "All F32");
         assert_eq!(super::file_type(1), "Mostly F16");
         assert_eq!(super::file_type(2), "Mostly Q4_0");
+        assert_eq!(super::file_type(4), "unknown");
+        assert_eq!(super::file_type(5), "unknown");
         assert_eq!(super::file_type(7), "Mostly Q8_0");
-        assert_eq!(super::file_type(14), "Mostly Q6_K");
-        assert_eq!(super::file_type(24), "Mostly BF16");
+        assert_eq!(super::file_type(11), "Mostly Q3_K_S");
+        assert_eq!(super::file_type(15), "Mostly Q4_K_M");
+        assert_eq!(super::file_type(18), "Mostly Q6_K");
+        assert_eq!(super::file_type(32), "Mostly BF16");
+        assert_eq!(super::file_type(33), "unknown");
+        assert_eq!(super::file_type(38), "Mostly MXFP4_MOE");
+        assert_eq!(super::file_type(40), "Mostly Q1_0");
         assert_eq!(super::file_type(99), "unknown");
+        assert_eq!(super::file_type(2 | super::FTYPE_GUESSED), "Mostly Q4_0 (guessed)");
     }
 
     #[test]
@@ -1899,10 +2048,8 @@ mod tests {
 
         // With max_array_size=1, arrays should be truncated
         let tokens = model.kv.get("tokenizer.ggml.tokens");
-        if let Some(tokens_arr) = tokens {
-            if let serde_json::Value::Array(arr) = tokens_arr {
-                assert!(arr.len() <= 1, "Array should be truncated to max size");
-            }
+        if let Some(serde_json::Value::Array(arr)) = tokens {
+            assert!(arr.len() <= 1, "Array should be truncated to max size");
         }
     }
 
@@ -2165,6 +2312,57 @@ mod tests {
         let bytes = build_v3(&[TestKv::StrLen("general.file_type", 0)], &[]);
         let model = decode_bytes(bytes).unwrap();
         assert_eq!(model.file_type(), "unknown");
+    }
+
+    fn write_large_empty_gguf(path: &std::path::Path, total_size: u64) {
+        use std::io::Write;
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(&super::FILE_MAGIC_GGUF_LE.to_le_bytes())
+            .unwrap();
+        f.write_all(&super::GGUF_VERSION_V3.to_le_bytes()).unwrap();
+        f.write_all(&0u64.to_le_bytes()).unwrap(); // num_tensors
+        f.write_all(&0u64.to_le_bytes()).unwrap(); // num_kv
+        f.set_len(total_size).unwrap();
+    }
+
+    #[test]
+    fn streaming_helper_parses_large_file_with_small_header() {
+        let path =
+            std::env::temp_dir().join(format!("gguf-streaming-large-{}.gguf", std::process::id()));
+        let size = super::DEFAULT_MAX_HELPER_INPUT_BYTES + 4096;
+        write_large_empty_gguf(&path, size);
+
+        let result = super::get_gguf_container(path.to_str().unwrap());
+        let decoded = result.and_then(|mut c| c.decode());
+        let _ = std::fs::remove_file(&path);
+        let model = decoded.expect("streaming helper should parse large file");
+        assert_eq!(model.num_tensor(), 0);
+        assert_eq!(model.num_kv(), 0);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn snapshot_helper_rejects_large_file_with_helper_input_cap_error() {
+        let path =
+            std::env::temp_dir().join(format!("gguf-snapshot-large-{}.gguf", std::process::id()));
+        let size = super::DEFAULT_MAX_HELPER_INPUT_BYTES + 4096;
+        write_large_empty_gguf(&path, size);
+
+        let result = super::get_gguf_container_array_size_with_limit(
+            path.to_str().unwrap(),
+            3,
+            super::DEFAULT_MAX_HELPER_INPUT_BYTES,
+        );
+        let _ = std::fs::remove_file(&path);
+        let err = match result {
+            Ok(_) => panic!("snapshot helper should reject oversized file"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds helper input cap"),
+            "expected legacy cap error, got: {msg}"
+        );
     }
 
     #[test]

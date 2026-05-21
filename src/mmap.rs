@@ -1,8 +1,19 @@
-//! Memory-mapped GGUF file support
+//! `MmapGGUF`: in-memory snapshot reader.
 //!
-//! This module provides memory-mapped file access for GGUF files,
-//! which is more efficient for large files as it avoids loading
-//! the entire file into memory.
+//! `open()` reads the whole file into an anonymous mapped buffer
+//! (`MmapMut::map_anon` + `read_exact`) and parses from that frozen
+//! copy. This is not a lazy file mapping; size is capped by
+//! [`DEFAULT_MAX_HELPER_INPUT_BYTES`](crate::DEFAULT_MAX_HELPER_INPUT_BYTES)
+//! (256 MiB default; configurable via `open_with_limits`).
+//!
+//! The snapshot is not atomic with respect to in-place mutation during
+//! the read itself — a concurrent writer can produce a torn image and
+//! the reader does not detect it. For stronger guarantees, hash-verify
+//! the file before parsing.
+//!
+//! For header-only parsing prefer the streaming helpers
+//! ([`get_gguf_container`](crate::get_gguf_container),
+//! [`get_gguf_container_array_size`](crate::get_gguf_container_array_size)).
 //!
 //! # Example
 //!
@@ -16,12 +27,6 @@
 //! println!("Tensors: {}", model.num_tensor());
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
-//!
-//! # Features
-//!
-//! - Immutable snapshot semantics for safer parsing
-//! - Efficient random access to tensor data
-//! - Backed by anonymous memory, not a live file mapping
 
 use anyhow::{anyhow, Result};
 use memmap2::{Mmap, MmapMut, MmapOptions};
@@ -30,15 +35,9 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::{GGUFModel, FILE_MAGIC_GGUF_BE, FILE_MAGIC_GGUF_LE};
+use crate::{GGUFModel, DEFAULT_MAX_HELPER_INPUT_BYTES, FILE_MAGIC_GGUF_BE, FILE_MAGIC_GGUF_LE};
 
-const DEFAULT_MAX_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
-
-/// Memory-mapped GGUF file
-///
-/// Provides efficient access to GGUF files using an immutable in-memory
-/// snapshot backed by anonymous mapped pages. This avoids exposing a live file
-/// mapping that can fault if the source file is concurrently mutated.
+/// In-memory snapshot GGUF reader.
 pub struct MmapGGUF {
     #[allow(dead_code)]
     mmap: Arc<Mmap>,
@@ -63,7 +62,8 @@ impl Read for MmapReader {
 }
 
 impl MmapGGUF {
-    /// Open a GGUF file with memory mapping
+    /// Open a GGUF file by snapshotting it into an anonymous in-memory
+    /// buffer and decoding from that frozen copy.
     ///
     /// # Arguments
     ///
@@ -73,8 +73,9 @@ impl MmapGGUF {
     ///
     /// Returns an error if:
     /// - The file does not exist
-    /// - The file cannot be memory mapped
+    /// - The snapshot allocation fails
     /// - The file has an invalid magic number
+    /// - The file exceeds [`DEFAULT_MAX_HELPER_INPUT_BYTES`]
     ///
     /// # Example
     ///
@@ -85,11 +86,11 @@ impl MmapGGUF {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        Self::open_with_limits(path, 3, DEFAULT_MAX_SNAPSHOT_BYTES)
+        Self::open_with_limits(path, 3, DEFAULT_MAX_HELPER_INPUT_BYTES)
     }
 
     pub fn open_with_array_size<P: AsRef<Path>>(path: P, max_array_size: u64) -> Result<Self> {
-        Self::open_with_limits(path, max_array_size, DEFAULT_MAX_SNAPSHOT_BYTES)
+        Self::open_with_limits(path, max_array_size, DEFAULT_MAX_HELPER_INPUT_BYTES)
     }
 
     pub fn open_with_limits<P: AsRef<Path>>(
@@ -146,22 +147,22 @@ impl MmapGGUF {
         Ok(Self { mmap, model })
     }
 
-    /// Get the decoded GGUF model
+    /// Get the decoded GGUF model.
     pub fn model(&self) -> &GGUFModel {
         &self.model
     }
 
-    /// Get a reference to the raw memory-mapped data
+    /// Borrow the in-memory snapshot of the file's bytes.
     pub fn as_slice(&self) -> &[u8] {
         self.mmap.as_ref()
     }
 
-    /// Get the size of the memory-mapped file
+    /// Length in bytes of the in-memory snapshot.
     pub fn len(&self) -> usize {
         self.mmap.len()
     }
 
-    /// Check if the file is empty
+    /// Whether the snapshot is empty (file of length 0).
     pub fn is_empty(&self) -> bool {
         self.mmap.is_empty()
     }

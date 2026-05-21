@@ -2,6 +2,64 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.0] - 2026-05-21
+
+### Breaking (behavior)
+
+- `get_gguf_container`, `get_gguf_container_array_size`,
+  `AsyncGGUF::open`, and `read_gguf*` stream from disk. They no longer
+  snapshot the file into memory and no longer reject inputs by total
+  file size. Header-bounded parser caps (`MAX_HEADER_BYTES`,
+  `MAX_METADATA_BYTES`, `MAX_TENSORS`, `MAX_KV`, `MAX_ARRAY_LEN`,
+  dimension/element bounds, alignment) and tensor EOF/range validation
+  still apply.
+
+  Callers that need a size cap or a frozen in-memory copy should use
+  `get_gguf_container_array_size_with_limit` /
+  `AsyncGGUF::open_with_limits` (now `#[deprecated]`, snapshot+cap
+  behavior unchanged) or `MmapGGUF::open_with_limits`.
+
+### Added
+
+- `DEFAULT_MAX_HELPER_INPUT_BYTES` is now `pub`.
+- Sync streaming wraps the `File` in `BufReader`.
+- Regression tests: streaming helpers parse files larger than
+  `DEFAULT_MAX_HELPER_INPUT_BYTES`; deprecated `_with_limit` helpers
+  still reject them with
+  `"file size {N} exceeds helper input cap {M} bytes"` /
+  `"file size {N} exceeds async input cap {M} bytes"`.
+- `GGMLType` variants `NVFP4 = 40` and `Q1_0 = 41`; `Count` bumped to
+  42. Layouts added in `ggml_type_layout`.
+
+### Fixed
+
+- `file_type()` now reflects llama.cpp's `llama_ftype` enum (`llama.h`).
+  Previously, slots 11–14 misreported `Q3_K_S`/`Q3_K_M`/`Q3_K_L`/`Q4_K_S`
+  as `Q3_K`/`Q4_K`/`Q5_K`/`Q6_K`, and slots 15+ misreported the K-quant
+  Medium/Large variants and IQ family. Adds Q2_K_S, IQ3_M, IQ2_M,
+  TQ1_0/TQ2_0, MXFP4_MOE, NVFP4, Q1_0. Removed-upstream slots
+  (Q4_2/Q4_3, Q4_1_SOME_F16, Q4_0 repack triplet) now report "unknown".
+  The `GUESSED` flag (bit 1024) is masked and reported as a suffix.
+
+### Deprecated
+
+- `get_gguf_container_array_size_with_limit`,
+  `AsyncGGUF::open_with_limits`.
+
+### Changed
+
+- `AsyncGGUF` retains the `std::fs::File` validated at `open()` and
+  `try_clone()`s it into `decode()`. `decode()` re-stats and
+  re-validates magic/byte order against the live descriptor, returning
+  `"GGUF byte order changed between open() and decode()"` on mismatch.
+- `MmapGGUF` docs corrected: anonymous in-memory snapshot, not a lazy
+  live mapping; not atomic against in-place mutation during the read.
+- Crate-level rustdoc adds a "Parsing untrusted files" section with the
+  enforced parser caps and per-helper materialization / size-cap /
+  TOCTOU posture.
+- `SECURITY.md` reduced to reporting policy; contact updated to the
+  fork maintainer.
+
 ## [0.1.7] - 2026-02-16
 
 ### Security
