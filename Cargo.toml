@@ -25,11 +25,11 @@ categories = ["parser-implementations", "science"]
 [dependencies]
 anyhow = "1.0.101"
 byteorder = "1.5.0"
-clap = { version = "4.5.58", features = ["derive"] }
+clap = { version = "4.6.1", features = ["derive"] }
 comfy-table = "7.2.2"
-log = "0.4.27"
+log = "0.4.30"
 serde = { version = "1.0.219", features = ["derive"] }
-serde_json = { version = "1.0.149", features = ["arbitrary_precision"] }
+serde_json = { version = "1.0.150", features = ["arbitrary_precision"] }
 simple_logger = "5.0.1"
 
 # Optional dependencies
@@ -37,7 +37,7 @@ memmap2 = { version = "0.9", optional = true }
 tokio = { version = "1", optional = true, features = ["fs", "io-util", "rt-multi-thread", "macros"] }
 
 [dev-dependencies]
-criterion = "0.5"
+criterion = "0.8"
 
 [features]
 default = []
