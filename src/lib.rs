@@ -261,6 +261,7 @@ fn file_type(ft: u64) -> String {
         38 => "Mostly MXFP4_MOE",
         39 => "Mostly NVFP4",
         40 => "Mostly Q1_0",
+        41 => "Mostly Q2_0",
         _ => "unknown",
     }
     .to_string()
@@ -730,7 +731,8 @@ pub enum GGMLType {
     MXFP4 = 39,
     NVFP4 = 40,
     Q1_0 = 41,
-    Count = 42,
+    Q2_0 = 42,
+    Count = 43,
 }
 
 impl Display for GGMLType {
@@ -778,6 +780,7 @@ impl Display for GGMLType {
             GGMLType::MXFP4 => write!(f, "MXFP4"),
             GGMLType::NVFP4 => write!(f, "NVFP4"),
             GGMLType::Q1_0 => write!(f, "Q1_0"),
+            GGMLType::Q2_0 => write!(f, "Q2_0"),
             GGMLType::Count => write!(f, "Count"),
         }
     }
@@ -828,6 +831,7 @@ impl TryFrom<u32> for GGMLType {
             39 => GGMLType::MXFP4,
             40 => GGMLType::NVFP4,
             41 => GGMLType::Q1_0,
+            42 => GGMLType::Q2_0,
             _ => return Err(anyhow!("invalid GGML type")),
         })
     }
@@ -900,6 +904,7 @@ fn ggml_type_layout(kind: GGMLType) -> Result<(u64, u64)> {
         GGMLType::MXFP4 => (32, 17),
         GGMLType::NVFP4 => (64, 36),
         GGMLType::Q1_0 => (128, 18),
+        GGMLType::Q2_0 => (64, 18),
         GGMLType::Count => (0, 0),
     };
     if block_size == 0 || type_size == 0 {
@@ -1863,6 +1868,7 @@ mod tests {
         assert_eq!(super::file_type(33), "unknown");
         assert_eq!(super::file_type(38), "Mostly MXFP4_MOE");
         assert_eq!(super::file_type(40), "Mostly Q1_0");
+        assert_eq!(super::file_type(41), "Mostly Q2_0");
         assert_eq!(super::file_type(99), "unknown");
         assert_eq!(super::file_type(2 | super::FTYPE_GUESSED), "Mostly Q4_0 (guessed)");
     }
