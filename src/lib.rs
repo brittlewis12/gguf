@@ -262,6 +262,7 @@ fn file_type(ft: u64) -> String {
         39 => "Mostly NVFP4",
         40 => "Mostly Q1_0",
         41 => "Mostly Q2_0",
+        42 => "Mostly F8_E4M3",
         _ => "unknown",
     }
     .to_string()
@@ -732,7 +733,8 @@ pub enum GGMLType {
     NVFP4 = 40,
     Q1_0 = 41,
     Q2_0 = 42,
-    Count = 43,
+    F8_E4M3 = 43,
+    Count = 44,
 }
 
 impl Display for GGMLType {
@@ -781,6 +783,7 @@ impl Display for GGMLType {
             GGMLType::NVFP4 => write!(f, "NVFP4"),
             GGMLType::Q1_0 => write!(f, "Q1_0"),
             GGMLType::Q2_0 => write!(f, "Q2_0"),
+            GGMLType::F8_E4M3 => write!(f, "F8_E4M3"),
             GGMLType::Count => write!(f, "Count"),
         }
     }
@@ -832,7 +835,8 @@ impl TryFrom<u32> for GGMLType {
             40 => GGMLType::NVFP4,
             41 => GGMLType::Q1_0,
             42 => GGMLType::Q2_0,
-            _ => return Err(anyhow!("invalid GGML type")),
+            43 => GGMLType::F8_E4M3,
+            value => return Err(anyhow!("invalid GGML type {value}")),
         })
     }
 }
@@ -905,6 +909,7 @@ fn ggml_type_layout(kind: GGMLType) -> Result<(u64, u64)> {
         GGMLType::NVFP4 => (64, 36),
         GGMLType::Q1_0 => (128, 18),
         GGMLType::Q2_0 => (64, 18),
+        GGMLType::F8_E4M3 => (1, 1),
         GGMLType::Count => (0, 0),
     };
     if block_size == 0 || type_size == 0 {
@@ -1869,6 +1874,7 @@ mod tests {
         assert_eq!(super::file_type(38), "Mostly MXFP4_MOE");
         assert_eq!(super::file_type(40), "Mostly Q1_0");
         assert_eq!(super::file_type(41), "Mostly Q2_0");
+        assert_eq!(super::file_type(42), "Mostly F8_E4M3");
         assert_eq!(super::file_type(99), "unknown");
         assert_eq!(super::file_type(2 | super::FTYPE_GUESSED), "Mostly Q4_0 (guessed)");
     }
@@ -1908,6 +1914,8 @@ mod tests {
         assert!(matches!(GGMLType::try_from(10), Ok(GGMLType::Q2_K)));
         assert!(matches!(GGMLType::try_from(30), Ok(GGMLType::BF16)));
         assert!(matches!(GGMLType::try_from(39), Ok(GGMLType::MXFP4)));
+        assert!(matches!(GGMLType::try_from(42), Ok(GGMLType::Q2_0)));
+        assert!(matches!(GGMLType::try_from(43), Ok(GGMLType::F8_E4M3)));
     }
 
     #[test]
@@ -1917,11 +1925,18 @@ mod tests {
     }
 
     #[test]
+    fn test_f8_e4m3_layout_matches_current_ggml() {
+        let (block_size, type_size) = super::ggml_type_layout(super::GGMLType::F8_E4M3).unwrap();
+        assert_eq!((block_size, type_size), (1, 1));
+    }
+
+    #[test]
     fn test_ggml_type_invalid() {
         use super::GGMLType;
         use std::convert::TryFrom;
 
-        assert!(GGMLType::try_from(100).is_err());
+        let unknown = GGMLType::try_from(100).unwrap_err().to_string();
+        assert!(unknown.contains("100"), "{unknown}");
         assert!(GGMLType::try_from(255).is_err());
     }
 
